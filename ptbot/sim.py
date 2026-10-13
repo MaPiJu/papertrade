@@ -15,10 +15,19 @@ import time
 from dataclasses import dataclass, field
 
 from .constants import SCALE
+from .papertrade_api import IntentRejected
 from .positions import Position
 from .strategy import liq_distance
 
 DEADBAND = 0.00002
+
+# (b, K) hypotheses for the profit haircut, from most to least favourable:
+# community measurements after launch, rusk0f's reported costs, pre-launch bytecode reading.
+HAIRCUT_MODELS = {
+    "optimiste": (0.10, 0.000216),
+    "rusk0f": (0.10, 0.001868),
+    "pessimiste": (0.10, 0.0101),
+}
 
 
 def haircut(move: float, b: float, k: float) -> float:
@@ -144,9 +153,9 @@ class SimVenue:
         self._liquidate()
         acc = self.accounts[w]
         if margin > acc.usdc + 1e-9:
-            raise RuntimeError(f"solde insuffisant sur {w}")
+            raise IntentRejected(f"solde insuffisant sur {w}")
         if margin < self.mins[0] or margin * leverage < self.mins[1] - 1e-6:
-            raise RuntimeError("taille sous le minimum")
+            raise IntentRejected("taille sous le minimum")
         pid = next(self.ids)
         acc.usdc -= margin
         acc.positions[pid] = SimPos(pid, coin, is_long, margin, leverage, self.mid(coin))
@@ -180,7 +189,7 @@ class SimVenue:
     def withdraw_to_core(self, w: str, amount: float) -> str:
         acc = self.accounts[w]
         if amount > acc.usdc + 1e-9:
-            raise RuntimeError("retrait supérieur au solde")
+            raise IntentRejected("retrait supérieur au solde")
         acc.usdc -= amount
         acc.core_spot += amount
         return "sim-withdraw"

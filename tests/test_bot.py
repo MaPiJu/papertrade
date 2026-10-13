@@ -1,6 +1,7 @@
 """End-to-end scenarios of the state machine against the offline simulator."""
 from ptbot.bot import Bot, StateStore, Timing
 from ptbot.constants import SCALE
+from ptbot.papertrade_api import IntentRejected
 from ptbot.sim import SimVenue
 from ptbot.strategy import Params
 
@@ -94,7 +95,7 @@ def test_cost_cap_pauses_farming_but_keeps_staking(tmp_path):
 class RejectShortVenue(SimVenue):
     def open(self, w, *a, **k):
         if w == "B":
-            raise RuntimeError("refusé")
+            raise IntentRejected("refusé")
         return super().open(w, *a, **k)
 
 

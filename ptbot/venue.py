@@ -15,7 +15,8 @@ from pathlib import Path
 from eth_account import Account
 
 from .chain import HyperEvm
-from .constants import FEE_ADDRESS, INSTRUMENTS, SCALE, SESSION_KEY_LIFETIME_S
+from .constants import (FEE_ADDRESS, INSTRUMENTS, SCALE, SESSION_KEY_LIFETIME_S, STAKE_DEADLINE_S,
+                        WITHDRAW_DEADLINE_S)
 from .hyperliquid import HyperliquidInfo, HyperliquidTransfers
 from .papertrade_api import PaperTradeApi
 from .positions import Position, open_positions
@@ -125,7 +126,7 @@ class LiveVenue:
     def stake(self, w: str, amount_raw: int) -> str:
         return self._submit(self.wallets[w].private_key, "Stake", {
             "user": self.addr(w), "amount": amount_raw,
-            "nonce": self.nonces.next(), "deadline": self._deadline()})
+            "nonce": self.nonces.next(), "deadline": self._deadline(STAKE_DEADLINE_S)})
 
     def claim(self, w: str) -> str:
         return self._submit(self.wallets[w].private_key, "Claim", {
@@ -134,7 +135,7 @@ class LiveVenue:
     def withdraw_to_core(self, w: str, amount: float) -> str:
         return self._submit(self.wallets[w].private_key, "WithdrawToCore", {
             "user": self.addr(w), "amount": int(round(amount * 100)) * SCALE // 100,
-            "nonce": self.nonces.next(), "deadline": self._deadline()})
+            "nonce": self.nonces.next(), "deadline": self._deadline(WITHDRAW_DEADLINE_S)})
 
     def core_perp_to_spot(self, w: str, amount: float) -> None:
         self.transfers[w].perp_to_spot(amount)

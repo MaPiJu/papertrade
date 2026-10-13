@@ -112,7 +112,7 @@ def cmd_status(settings, args) -> None:
 
 def cmd_plan(settings, args) -> None:
     """Read-only: what the bot would do right now."""
-    from .sim import haircut
+    from .sim import HAIRCUT_MODELS, haircut
     from .strategy import Skip, plan_open, plan_rebalance
 
     venue = build_live(settings)
@@ -120,7 +120,7 @@ def cmd_plan(settings, args) -> None:
     bal = {w: venue.usdc(w) for w in ("A", "B")}
     mins = venue.minimums()
     print(f"Soldes PaperTrade: A={bal['A']:.2f}$  B={bal['B']:.2f}$   minimums: marge {mins[0]:.2f}$, notionnel {mins[1]:,.0f}$")
-    t = plan_rebalance(bal["A"], bal["B"], p)
+    t = plan_rebalance(bal["A"], bal["B"], p, mins[1])
     if t:
         print(f"-> d'abord rééquilibrer: {t.amount:.2f}$ de {t.src} vers {t.dst}")
         half = (bal["A"] + bal["B"]) / 2
@@ -130,20 +130,19 @@ def cmd_plan(settings, args) -> None:
         print(f"-> pas de cycle: {plan.reason}")
         return
     loss = plan.notional * plan.close_move
-    h = haircut(plan.close_move, 0.10, 0.000216)
-    cost = loss * h
     print(f"-> cycle: marge {plan.margin:.2f}$ x{plan.leverage} sur chaque wallet ({plan.notional:,.0f}$ de notionnel), "
-          f"fermeture à ±{plan.close_move:.2%}")
-    print(f"   estimation: perte de la jambe perdante {loss:.2f}$, haircut ~{h:.0%} sur le gain -> coût ~{cost:.2f}$ par cycle")
-    print(f"   PAPER par cycle ~ {loss * 0.98:.2f} x émission (PAPER/$)."
-          f" Le plafond de {p.max_cost_per_1000}$/1000 est atteint sous ~{h / 0.98 / p.max_cost_per_1000 * 1000:.0f} PAPER/$")
+          f"fermeture à ±{plan.close_move:.2%}; la jambe perdante perd ~{loss:.2f}$ et mint ~{loss * 0.98:.2f} x E PAPER")
     emission = venue.evm.emission_per_usd()
-    if emission:
-        est = cost / (loss * 0.98 * emission) * 1000
-        print(f"   émission actuelle ~{emission:.1f} PAPER/$ -> ~{loss * 0.98 * emission:,.0f} PAPER par cycle, "
-              f"~{est:.2f}$/1000 PAPER ({'au-dessus' if est > p.max_cost_per_1000 else 'sous'} le plafond)")
-    else:
-        print("   émission actuelle illisible on-chain: le coût réel sera mesuré après chaque cycle")
+    print(f"   émission E: {f'~{emission:.1f} PAPER/$ (on-chain)' if emission else 'illisible on-chain'}")
+    print("   Le haircut réel est inconnu; coût estimé selon 3 hypothèses:")
+    for name, (b, k) in HAIRCUT_MODELS.items():
+        h = haircut(plan.close_move, b, k)
+        e_cap = h / 0.98 / p.max_cost_per_1000 * 1000
+        line = f"     {name:10} haircut {h:4.0%}: coût ~{loss * h:6.2f}$ par cycle, plafond {p.max_cost_per_1000}$/1000 atteint sous E={e_cap:.0f}"
+        if emission:
+            line += f" -> ~{loss * h / (loss * 0.98 * emission) * 1000:.2f}$/1000 aujourd'hui"
+        print(line)
+    print("   Le coût réel est mesuré après chaque cycle; avec COST_WINDOW=1 le bot s'arrête dès le premier cycle trop cher.")
 
 
 def cmd_register(settings, args) -> None:

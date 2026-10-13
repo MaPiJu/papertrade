@@ -60,7 +60,7 @@ def load_settings(env_file: str = ".env", need_keys: bool = True) -> Settings:
         min_rebalance_usd=_f("MIN_REBALANCE_USD", 5),
         stake_threshold=_f("STAKE_THRESHOLD_PAPER", 1000),
         max_cost_per_1000=_f("MAX_COST_PER_1000_PAPER", 7),
-        cost_window=int(_f("COST_WINDOW", 3)),
+        cost_window=int(_f("COST_WINDOW", 1)),
     )
     return Settings(
         wallets=wallets,

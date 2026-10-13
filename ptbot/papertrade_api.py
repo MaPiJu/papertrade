@@ -18,7 +18,22 @@ HEADERS = {
 
 
 class IntentRejected(RuntimeError):
-    pass
+    """The relayer answered and refused the intent: it will never execute."""
+
+
+LIST_KEYS = ("items", "events", "trades", "positions", "rows", "data")
+
+
+def _list_payload(data) -> list:
+    """The list inside a read response. An unexpected shape raises instead of
+    being read as "no positions", which would make the bot lose track of a pair."""
+    if isinstance(data, list):
+        return data
+    if isinstance(data, dict):
+        for key in LIST_KEYS:
+            if isinstance(data.get(key), list):
+                return data[key]
+    raise ValueError(f"réponse inattendue de l'API (clés {sorted(data) if isinstance(data, dict) else type(data)})")
 
 
 class PaperTradeApi:
@@ -76,7 +91,7 @@ class PaperTradeApi:
         for _ in range(pages):
             data = self.get(f"/query/accounts/{address.lower()}/trades",
                             params={"cursor": cursor} if cursor else None)
-            items.extend(data.get("items", []) if isinstance(data, dict) else data)
+            items.extend(_list_payload(data))
             cursor = data.get("nextCursor") if isinstance(data, dict) else None
             if not cursor:
                 break

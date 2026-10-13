@@ -32,6 +32,11 @@ LIQ_BUFFER = 0.0005
 DEFAULT_MIN_MARGIN_USD = 10.0
 DEFAULT_MIN_NOTIONAL_USD = 10_000.0
 
+# Lifetimes of signed intents: after the deadline the relayer can no longer
+# execute them, which is what lets the bot safely retry.
+STAKE_DEADLINE_S = 300
+WITHDRAW_DEADLINE_S = 600
+
 FEE_ADDRESS = "0x0000000000000000000000000000000000000000"
 SESSION_KEY_LIFETIME_S = 30 * 24 * 3600
 

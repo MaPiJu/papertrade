@@ -53,3 +53,14 @@ def test_cost_cap_needs_a_full_window():
     hit, avg = cost_cap_hit(hist, p)
     assert hit and math.isclose(avg, 8)
     assert not cost_cap_hit([{"usd": 5, "paper": 1000}] * 3, p)[0]
+
+
+def test_small_gap_is_rebalanced_when_it_alone_blocks_the_min_notional():
+    assert plan_rebalance(98.88, 103.0, Params()) is None
+    t = plan_rebalance(98.88, 103.0, Params(), min_notional=10_000)
+    assert (t.src, t.dst, t.amount) == ("B", "A", 2.06)
+
+
+def test_default_cost_cap_judges_each_cycle():
+    hit, avg = cost_cap_hit([{"usd": 9, "paper": 1000}], Params())
+    assert hit and avg == 9

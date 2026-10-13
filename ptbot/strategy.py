@@ -30,7 +30,7 @@ class Params:
     min_rebalance_usd: float = 5.0
     stake_threshold: float = 1000.0    # stake as soon as a wallet holds this much unstaked PAPER
     max_cost_per_1000: float = 7.0     # USD per 1,000 PAPER above which farming stops
-    cost_window: int = 3               # cycles averaged for the cost cap
+    cost_window: int = 1               # cycles averaged for the cost cap (1 = rusk0f's per-cycle rule)
 
 
 @dataclass
@@ -86,13 +86,15 @@ def plan_open(bal_a: float, bal_b: float, min_margin: float, min_notional: float
     return OpenPlan(margin=margin, leverage=leverage, close_move=move)
 
 
-def plan_rebalance(bal_a: float, bal_b: float, p: Params) -> Transfer | None:
+def plan_rebalance(bal_a: float, bal_b: float, p: Params, min_notional: float = 0.0) -> Transfer | None:
     total = bal_a + bal_b
     diff = abs(bal_a - bal_b)
-    if total <= 0 or diff / total < p.rebalance_threshold:
+    if total <= 0:
         return None
     amount = floor_cents(diff / 2)
-    if amount < p.min_rebalance_usd:
+    # Even a small gap must be closed when it alone keeps the smaller wallet under the minimum notional.
+    blocking = min(bal_a, bal_b) * p.max_leverage < min_notional <= total / 2 * p.max_leverage
+    if amount <= 0 or (not blocking and (diff / total < p.rebalance_threshold or amount < p.min_rebalance_usd)):
         return None
     return Transfer("A", "B", amount) if bal_a > bal_b else Transfer("B", "A", amount)
 

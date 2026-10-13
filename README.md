@@ -10,8 +10,8 @@ méthode décrite par [@rusk0f](https://x.com/rusk0f/status/2109921167830389061)
 - **staking automatique** : dès qu'un wallet détient 1 000 PAPER non stakés, le bot les stake, sans attendre de « go » ;
 - **rééquilibrage des USDC** : après chaque cycle, un wallet a gagné et l'autre perdu. Le bot retire la moitié de
   l'écart du wallet riche vers HyperCore, puis l'envoie à l'adresse de dépôt PaperTrade de l'autre wallet ;
-- **arrêt automatique** : si les 3 derniers cycles ont coûté en moyenne plus de 7 $ pour 1 000 PAPER, le bot arrête
-  d'ouvrir des paires (l'émission baisse avec le temps), mais continue de staker.
+- **arrêt automatique** : dès qu'un cycle a coûté plus de 7 $ pour 1 000 PAPER, le bot arrête d'ouvrir des paires
+  (l'émission baisse avec le temps), mais continue de staker.
 
 ```
 idle ──► (rééquilibrage A⇄B si besoin) ──► ouverture long A + short B ──► surveillance du prix BBO Hyperliquid
@@ -32,7 +32,7 @@ idle ──► (rééquilibrage A⇄B si besoin) ──► ouverture long A + sh
 - **Capital et notionnel minimum.** Une position doit faire au moins 10 000 $ de notionnel. Avec 100 $ par wallet
   en x100, vous êtes **pile au minimum** : après le premier cycle (~9 $ de coût en simulation), les soldes
   repassent sous 100 $ et le bot ne peut plus ouvrir en x100. Il l'affiche et attend. Pour enchaîner les cycles,
-  il faut soit plus d'USDC (sur 72 h simulées : 150 $/wallet ≈ 9 cycles, 250 $/wallet ≈ 20 cycles), soit
+  il faut soit plus d'USDC (150 $/wallet ≈ 2 à 9 cycles selon le haircut réel, 250 $/wallet environ le double), soit
   autoriser le levier à monter (`MAX_LEVERAGE=150` ou 200), ce qui rapproche la liquidation. Dans tous les cas,
   ~100 $ par wallet restent immobilisés comme marge minimale : seul l'excédent est « brûlé » pour minter.
 - **Le coût par PAPER a augmenté.** rusk0f s'est arrêté quand un cycle dépassait 7 $/1 000 PAPER. Si l'émission
@@ -43,6 +43,8 @@ idle ──► (rééquilibrage A⇄B si besoin) ──► ouverture long A + sh
 - **Clés privées.** Le bot a besoin des clés des deux wallets : le staking et les retraits sont signés par le
   wallet principal. Utilisez deux wallets dédiés, ne mettez que ce que vous acceptez de perdre, gardez `.env` et
   `data/session_keys.json` pour vous.
+- **Wallets dédiés.** Entre deux cycles, le bot **ferme toute position qu'il ne gère pas** sur A et B (un ordre
+  exécuté en retard, une réponse perdue… ou un trade fait à la main). Ne tradez pas à la main sur ces wallets.
 
 ## Installation
 
@@ -88,12 +90,26 @@ aussi exister sur Hyperliquid (HyperCore), puisque le rééquilibrage passe par 
 | `close-all` | ferme toutes les positions des deux wallets |
 | `resume` | lève une pause (`--reset-costs` oublie l'historique de coût) |
 
-**Arrêter le bot** : `Ctrl+C`, ou créez un fichier `STOP` dans le dossier. Une paire ouverte **reste ouverte** :
-au redémarrage, le bot reprend le cycle en cours (`data/state.json`). Pour tout couper : `close-all`.
+**Arrêter le bot** : `Ctrl+C` (ou `kill`, ou un fichier `STOP` dans le dossier). Le bot termine l'étape en
+cours puis s'arrête ; un second `Ctrl+C` force l'arrêt. Une paire ouverte **reste ouverte** : au redémarrage, le
+bot reprend le cycle en cours (`data/state.json`). Pour tout couper : `close-all`.
+
+**Ce qui est géré en cas de problème** :
+- réponse perdue ou erreur réseau sur un ordre : l'ordre est considéré comme « peut-être exécuté ». Le bot le
+  surveille jusqu'à son expiration (2 min) et n'ouvre jamais une nouvelle paire avant ;
+- une jambe ouverte seule : sa perte est surveillée et elle est fermée dès qu'elle atteint la distance de sortie,
+  ou à l'expiration de l'autre ordre ;
+- l'état est sauvegardé **avant** chaque ordre et chaque transfert : un crash ou un redémarrage reprend où il en
+  était, sans rouvrir de paire ni retirer deux fois ;
+- une lecture d'API vide ou en retard ne ferme pas la paire (3 lectures manquées d'affilée sont nécessaires) ;
+- chaque jambe sort sur son propre prix d'entrée, même si les deux ont été exécutées à des prix différents ;
+- les transferts lents (retrait vers HyperCore, crédit du dépôt) sont attendus jusqu'à 2 h, avec relance automatique
+  si un retrait a expiré sans être exécuté.
 
 **Pauses** : le bot se met en pause (et continue de staker) quand le plafond de coût est atteint, quand un
-rééquilibrage bloque, après 5 ouvertures refusées, ou si les soldes bougent alors que l'API ne montre aucune
-position. Le motif est dans `data/bot.log`. Corrigez, puis `python -m ptbot resume`.
+rééquilibrage reste bloqué 2 h, après 3 paires ratées d'affilée, si une position reste listée après 8 tentatives de
+fermeture, ou si les soldes bougent alors que l'API ne montre aucune position. Le motif est dans `data/bot.log`.
+Corrigez, puis `python -m ptbot resume`.
 
 ## Paramètres (.env)
 
@@ -105,7 +121,7 @@ position. Le motif est dans `data/bot.log`. Corrigez, puis `python -m ptbot resu
 | `MARGIN_FRACTION` / `MAX_MARGIN_USD` | 1.0 / 0 | marge par jambe = plus petit solde × fraction (plafonnée) |
 | `REBALANCE_THRESHOLD_PCT` / `MIN_REBALANCE_USD` | 10 / 5 | quand rééquilibrer |
 | `STAKE_THRESHOLD_PAPER` | 1000 | seuil de staking automatique |
-| `MAX_COST_PER_1000_PAPER` / `COST_WINDOW` | 7 / 3 | arrêt quand le coût moyen dépasse le plafond |
+| `MAX_COST_PER_1000_PAPER` / `COST_WINDOW` | 7 / 1 | arrêt dès qu'un cycle (ou la moyenne de N cycles) dépasse le plafond |
 
 Un `CLOSE_MOVE_PCT` plus grand coûte moins cher par PAPER (le haircut baisse quand le mouvement grandit), mais
 laisse moins de marge avant la liquidation, et les cycles durent plus longtemps.
@@ -133,7 +149,9 @@ python -m pytest -q
 
 Signatures EIP-712, logique de décision, parseur de positions, et scénarios de bout en bout contre le simulateur :
 cycle normal, staking, rééquilibrage, gap au-delà de la liquidation, plafond de coût, jambe refusée, réponse
-perdue, positions invisibles, reprise après redémarrage.
+perdue, positions invisibles, reprise après redémarrage. `tests/test_faults.py` couvre les pannes : réponses
+perdues, exécutions tardives, ordres jamais exécutés, lectures d'API vides ou en retard, positions fantômes, crash
+entre un ordre et la sauvegarde, transferts et stakes lents.
 
 ## Sources
 

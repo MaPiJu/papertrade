@@ -1,6 +1,7 @@
 """HTTP client for exchange.papertrade.xyz (public reads + POST /intents)."""
 from __future__ import annotations
 
+import email.utils
 import logging
 import time
 
@@ -22,6 +23,26 @@ class IntentRejected(RuntimeError):
 
 
 LIST_KEYS = ("items", "events", "trades", "positions", "rows", "data")
+TIME_KEYS = ("timestamp", "ts", "time", "timeMs", "createdAt", "blockTime", "blockTimestamp", "blockNumber", "block")
+
+
+def _event_time(item) -> float | None:
+    if not isinstance(item, dict):
+        return None
+    for source in [item] + [v for v in item.values() if isinstance(v, dict)]:
+        for k in TIME_KEYS:
+            v = source.get(k)
+            if isinstance(v, (int, float)) or (isinstance(v, str) and v.isdigit()):
+                return float(v)
+    return None
+
+
+def _page_order(page: list) -> str | None:
+    """'asc' (oldest first) or 'desc' (newest first) from the events' timestamps."""
+    times = [t for t in map(_event_time, page) if t is not None]
+    if len(times) < 2 or times[0] == times[-1]:
+        return None
+    return "asc" if times[-1] > times[0] else "desc"
 
 
 def _list_payload(data) -> list:
@@ -42,6 +63,8 @@ class PaperTradeApi:
         self.timeout = timeout
         self.http = requests.Session()
         self.http.headers.update(HEADERS)
+        self._orders: dict[str, str] = {}
+        self._pages: dict[str, dict] = {}
 
     def _request(self, method: str, path: str, timeout: float | None = None, retry: bool = True, **kw):
         # Only GETs are retried: a POSTed intent may already be queued even if the
@@ -87,15 +110,48 @@ class PaperTradeApi:
             return False
 
     def account_trades(self, address: str, pages: int = 3, timeout: float | None = None, retry: bool = True) -> list:
-        items, cursor = [], None
-        for _ in range(pages):
-            data = self.get(f"/query/accounts/{address.lower()}/trades",
-                            params={"cursor": cursor} if cursor else None, timeout=timeout, retry=retry)
-            items.extend(_list_payload(data))
-            cursor = data.get("nextCursor") if isinstance(data, dict) else None
-            if not cursor:
+        """The account's trade events. A newest-first feed only needs its first pages; an
+        oldest-first feed is followed to its end (its full pages never change, so they are
+        cached and fetched once), otherwise new positions would vanish past page 3."""
+        key = address.lower()
+        cache = self._pages.setdefault(key, {})
+        items, cursor, fetched = [], None, 0
+        while True:
+            if cursor in cache:
+                page, nxt = cache[cursor]
+            else:
+                data = self.get(f"/query/accounts/{key}/trades",
+                                params={"cursor": cursor} if cursor else None, timeout=timeout, retry=retry)
+                page = _list_payload(data)
+                nxt = data.get("nextCursor") if isinstance(data, dict) else None
+                fetched += 1
+                order = _page_order(page)
+                if order:
+                    self._orders[key] = order
+                if nxt and self._orders.get(key) == "asc":
+                    cache[cursor] = (page, nxt)
+            items.extend(page)
+            if not nxt:
                 break
+            if self._orders.get(key) != "asc" and fetched >= pages:
+                break
+            if fetched >= 200:
+                log.warning("Historique de %s: plus de 200 pages lues, lecture tronquée", key)
+                break
+            cursor = nxt
         return items
+
+    def trades_order(self, address: str) -> str | None:
+        return self._orders.get(address.lower())
+
+    def queue_total(self) -> float:
+        """Total profit waiting in the protocol's FIFO queue (USD)."""
+        data = self.get("/query/protocol/queue-summary")
+        return int(data.get("total") or 0) / SCALE
+
+    def server_time(self) -> float:
+        r = self._request("GET", "/query/ready", timeout=10)
+        return email.utils.parsedate_to_datetime(r.headers["Date"]).timestamp()
 
     def deposit_address(self, address: str) -> str | None:
         r = self._request("POST", "/funding/deposits/check", json={"user": address.lower()})
@@ -104,6 +160,17 @@ class PaperTradeApi:
         return (r.json() or {}).get("proxy")
 
     # --- writes ------------------------------------------------------------
+    def cancel(self, intent_id: str, signed: dict) -> dict:
+        r = self._request("POST", f"/intents/{intent_id}/cancel", json=signed)
+        if 400 <= r.status_code < 500:
+            raise IntentRejected(f"annulation de {intent_id} refusée (HTTP {r.status_code}): {r.text[:200]}")
+        if not r.ok:
+            raise RuntimeError(f"annulation de {intent_id}: réponse ambiguë (HTTP {r.status_code})")
+        try:
+            return r.json() or {}
+        except ValueError:
+            return {}
+
     def submit(self, body: dict) -> dict:
         """IntentRejected only when the relayer clearly refused (4xx or an error
         payload). A 5xx, a gateway error or an unreadable body may come after the

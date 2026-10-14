@@ -5,9 +5,10 @@ import argparse
 import json
 import logging
 import sys
+import time
 from pathlib import Path
 
-from .constants import DOMAIN_EXCHANGE, DOMAIN_STAKING, SCALE
+from .constants import DOMAIN_CANCEL, DOMAIN_EXCHANGE, DOMAIN_STAKING, SCALE
 
 log = logging.getLogger("ptbot")
 
@@ -30,7 +31,11 @@ def build_live(settings):
     from .venue import LiveVenue
 
     evm = HyperEvm(settings.rpc_url)
-    domains = resolve_domains(evm, {"exchange": DOMAIN_EXCHANGE, "staking": DOMAIN_STAKING})
+    try:
+        domains = resolve_domains(evm, {"exchange": DOMAIN_EXCHANGE, "staking": DOMAIN_STAKING,
+                                        "cancel": DOMAIN_CANCEL})
+    except RuntimeError as e:   # never sign with a guessed domain because the RPC was down
+        raise SystemExit(f"Domaines EIP-712 illisibles: {e}")
     return LiveVenue(settings.wallets, PaperTradeApi(settings.api_url), evm, HyperliquidInfo(settings.hl_url),
                      settings.hl_url, domains, settings.state_dir, settings.use_session_key)
 
@@ -54,6 +59,9 @@ def cmd_probe(settings, args) -> None:
     out_dir = settings.state_dir / "probe"
     out_dir.mkdir(parents=True, exist_ok=True)
     report = {
+        "clock_offset_vs_papertrade_s": _try(lambda: round(time.time() - api.server_time(), 1)),
+        "clock_offset_vs_hyperevm_s": _try(lambda: round(time.time() - evm.block_time(), 1)),
+        "profit_queue_total_usd": _try(api.queue_total),
         "state_trading": _try(api.trading_state),
         "minimums_usd": _try(api.minimums),
         "eip712_exchange_onchain": _try(evm.eip712_domain, EXCHANGE_CONTRACT),
@@ -64,9 +72,12 @@ def cmd_probe(settings, args) -> None:
         "wallets": {},
     }
     for label, w in settings.wallets.items():
-        trades = _try(api.account_trades, w.address, 1)
+        trades = _try(api.account_trades, w.address)
         report["wallets"][label] = {
             "address": w.address,
+            "balances_return_bytes": _try(evm.balances_return_size, w.address),
+            "trades_order": api.trades_order(w.address),
+            "trades_count": len(trades) if isinstance(trades, list) else trades,
             "usdc_papertrade": _try(evm.usdc_balance, w.address),
             "usdc_queued": _try(evm.queued_usdc, w.address),
             "paper_unstaked": _try(lambda a: evm.paper_balance_raw(a) / SCALE, w.address),
@@ -74,8 +85,9 @@ def cmd_probe(settings, args) -> None:
             "usdc_hypercore_perp": _try(hl.perp_withdrawable, w.address),
             "deposit_address_env": w.deposit_address,
             "deposit_address_api": _try(api.deposit_address, w.address),
-            "open_positions_parsed": [p.__dict__ for p in open_positions(trades)] if isinstance(trades, list) else trades,
-            "trades_raw_first_page": trades if isinstance(trades, list) else None,
+            "open_positions_parsed": (_try(lambda t: [p.__dict__ for p in open_positions(t)], trades)
+                                      if isinstance(trades, list) else trades),
+            "trades_raw_first_page": trades[:40] if isinstance(trades, list) else None,
             "funding_raw": _try(api.get, f"/query/accounts/{w.address.lower()}/funding"),
         }
     path = out_dir / "probe.json"
@@ -84,8 +96,9 @@ def cmd_probe(settings, args) -> None:
     print(json.dumps(summary, indent=1, default=str))
     for label, wr in report["wallets"].items():
         print(f"\nWallet {label} {wr['address']}")
-        for k in ("usdc_papertrade", "usdc_queued", "paper_unstaked", "usdc_hypercore_spot", "usdc_hypercore_perp",
-                  "deposit_address_env", "deposit_address_api", "open_positions_parsed"):
+        for k in ("balances_return_bytes", "trades_order", "trades_count", "usdc_papertrade", "usdc_queued",
+                  "paper_unstaked", "usdc_hypercore_spot", "usdc_hypercore_perp", "deposit_address_env",
+                  "deposit_address_api", "open_positions_parsed"):
             print(f"  {k:24} {wr[k]}")
     print(f"\nRéponses brutes complètes: {path}")
     for label, wr in report["wallets"].items():
@@ -103,6 +116,9 @@ def cmd_status(settings, args) -> None:
         print(f"Wallet {w} {venue.addr(w)}: {venue.usdc(w):.2f} USDC, "
               f"{venue.paper_raw(w) / SCALE:,.0f} PAPER non stakés, positions {[p.id for p in venue.positions(w)]}")
     print(f"Phase: {st['phase']}  Pause: {st.get('paused')}")
+    for w in WALLETS:
+        expiry = venue.key_expiry(w)
+        print(f"Session key {w}: " + (f"expire dans {(expiry - time.time()) / 86400:.1f} jours" if expiry else "absente"))
     t = st["totals"]
     print(f"Cycles: {t['cycles']}  PAPER générés: {t['paper_minted']:,.0f}  coût: {t['usd_spent']:.2f}$  "
           f"(+{t.get('usd_offcycle', 0):.2f}$ hors cycle)  PAPER stakés par le bot: {t['paper_staked']:,.0f}")
@@ -147,25 +163,92 @@ def cmd_plan(settings, args) -> None:
 
 def cmd_register(settings, args) -> None:
     venue = build_live(settings)
+    if venue.register_keys():
+        print("Session keys enregistrées. Attendez ~5 minutes avant la mini-position de test ou `run`.")
+    else:
+        raise SystemExit("Enregistrement refusé ou sans réponse claire (voir data/bot.log). Sans réponse claire: "
+                         "relancez `register` une fois. Si le message parle de signature, le format EIP-712 a changé; "
+                         "s'il parle d'origine/cookie, le relayer refuse les clients hors site: n'allez pas plus loin.")
+
+
+def startup_problems(settings, venue) -> list[str]:
+    """What must hold before the bot may trade real money (README, «Mise en route»)."""
+    problems = []
+    if not venue.keys_ready():
+        problems.append("session keys absentes ou proches de l'expiration: `python -m ptbot register`, "
+                        "puis attendez 5 minutes")
     for w in settings.wallets:
-        venue.ensure_session_key(w, force=True)
+        path = settings.state_dir / "preflight" / f"tiny_trade_{w}.json"
+        try:
+            verdict = json.loads(path.read_text()).get("verdict", [])
+        except (FileNotFoundError, ValueError):
+            problems.append(f"mini-position de test du wallet {w} jamais faite: "
+                            f"`python tools/preflight_tiny_trade.py --wallet {w} --i-understand-this-trades`")
+            continue
+        if any(v[0] == "FAIL" for v in verdict) or not any(v[0] == "PASS" and "visible" in v[1] for v in verdict):
+            problems.append(f"mini-position de test du wallet {w} en échec ({path}): ne lancez pas le bot")
+    for w, wallet in settings.wallets.items():
+        if not wallet.deposit_address:
+            problems.append(f"DEPOSIT_ADDRESS_{w} manquante dans .env")
+            continue
+        try:
+            from_api = venue.api.deposit_address(wallet.address)
+        except Exception as e:
+            log.warning("Adresse de dépôt de %s non vérifiable maintenant (%s)", w, e)
+            continue
+        if from_api and from_api.lower() != wallet.deposit_address.lower():
+            problems.append(f"DEPOSIT_ADDRESS_{w} ({wallet.deposit_address}) différente de celle de l'API ({from_api})")
+        try:
+            size = venue.evm.balances_return_size(wallet.address)
+            if size != 32:
+                problems.append(f"balances() renvoie {size} octets au lieu de 32: le solde libre serait mal lu")
+        except Exception as e:
+            problems.append(f"balances() illisible pour {w}: {e}")
+        try:
+            venue.queued(w)
+        except Exception as e:
+            problems.append(f"userQueuedTotal() illisible pour {w} (réseau ?): {e}")
+    try:
+        if not venue.queued_supported and venue.api.queue_total() > 0:
+            problems.append("la file de profits est active mais userQueuedTotal() n'existe pas sur le contrat: "
+                            "les profits en attente seraient comptés comme des pertes")
+    except Exception as e:
+        log.warning("File de profits non vérifiable maintenant (%s)", e)
+    offsets = []
+    for name, read in (("PaperTrade", venue.api.server_time), ("HyperEVM", venue.evm.block_time)):
+        try:
+            offsets.append((name, time.time() - read()))
+        except Exception as e:
+            log.warning("Heure de %s illisible (%s)", name, e)
+    for name, off in offsets:
+        if abs(off) > 10:
+            problems.append(f"horloge décalée de {off:+.0f} s par rapport à {name}: activez la synchronisation NTP")
+    return problems
 
 
 def cmd_run(settings, args) -> None:
     from .bot import Bot, StateStore
 
+    from .bot import IncompatibleState, Timing
+
+    venue = build_live(settings)
+    problems = startup_problems(settings, venue)
+    if problems:
+        print("Le bot ne démarre pas tant que ces points ne sont pas réglés:")
+        for p in problems:
+            print(f"  - {p}")
+        if not args.force:
+            raise SystemExit(1)
+        print("--force: démarrage malgré tout, à vos risques")
     if not args.yes:
         print("Le bot va trader de vrais fonds sur PaperTrade avec les deux wallets du fichier .env.")
         if input("Tapez OUI pour continuer: ").strip().upper() != "OUI":
             return
-    from .bot import IncompatibleState
-
-    venue = build_live(settings)
     store = StateStore(settings.state_dir / "state.json")
     log.info("Démarrage: A=%s (long), B=%s (short), %s x%d", venue.addr("A"), venue.addr("B"),
              settings.params.coin, settings.params.leverage)
     try:
-        bot = Bot(venue, settings.params, store)
+        bot = Bot(venue, settings.params, store, Timing(open_deadline_s=settings.open_deadline_s))
     except IncompatibleState as e:
         raise SystemExit(str(e))
     bot.run(stop_file=Path("STOP"))
@@ -213,11 +296,22 @@ def cmd_stake_now(settings, args) -> None:
 
 
 def cmd_close_all(settings, args) -> None:
+    state = settings.state_dir / "state.json"
+    if state.exists() and time.time() - state.stat().st_mtime < 30 and not args.force:
+        raise SystemExit("Le bot semble tourner (state.json modifié il y a moins de 30 s) et rouvrirait une paire: "
+                         "créez le fichier STOP, attendez qu'il s'arrête, puis relancez close-all (ou --force).")
     venue = build_live(settings)
     for w in settings.wallets:
-        ids = [p.id for p in venue.positions(w)]
+        try:
+            ids = [p.id for p in venue.positions(w)]
+        except Exception as e:
+            print(f"Wallet {w}: positions illisibles ({e}): fermez-les sur le site")
+            continue
         for i in range(0, len(ids), 25):  # 25 positions max per close
-            venue.close(w, ids[i:i + 25])
+            try:
+                venue.close(w, ids[i:i + 25])
+            except Exception as e:
+                print(f"Wallet {w}: fermeture de {ids[i:i + 25]} refusée ({e}): fermez-les sur le site")
         print(f"Wallet {w}: fermeture demandée pour {ids}")
 
 
@@ -243,6 +337,7 @@ def main(argv=None) -> None:
     sub.add_parser("register", help="enregistre une nouvelle session key pour chaque wallet")
     r = sub.add_parser("run", help="lance le bot (fonds réels)")
     r.add_argument("--yes", action="store_true", help="pas de confirmation (pour nohup/systemd)")
+    r.add_argument("--force", action="store_true", help="démarre même si les contrôles de sécurité échouent")
     s = sub.add_parser("sim", help="simulation hors-ligne de la stratégie")
     s.add_argument("--hours", type=float, default=24)
     s.add_argument("--usdc", type=float, default=100, help="USDC de départ par wallet")
@@ -252,7 +347,8 @@ def main(argv=None) -> None:
     s.add_argument("--live-prices", action="store_true", help="prix BBO Hyperliquid réels, temps réel")
     sn = sub.add_parser("stake-now", help="stake tout le PAPER non staké des deux wallets")
     sn.add_argument("--force", action="store_true", help="même si un cycle est en cours")
-    sub.add_parser("close-all", help="ferme toutes les positions des deux wallets")
+    ca = sub.add_parser("close-all", help="ferme toutes les positions des deux wallets")
+    ca.add_argument("--force", action="store_true", help="même si le bot semble tourner")
     rs = sub.add_parser("resume", help="lève la pause")
     rs.add_argument("--reset-costs", action="store_true", help="oublie l'historique de coût (plafond)")
     args = ap.parse_args(argv)

@@ -53,7 +53,10 @@ class Timing:
     submit_margin_s: float = 120.0   # bound on how long submitting both opens can take (crash recovery)
     close_retry_s: float = 12.0
     ghost_retry_s: float = 60.0
-    max_close_sends: int = 8         # closes of one position before pausing for a human
+    max_close_sends: int = 8         # closes of one position before pausing for a human...
+    ghost_after_s: float = 600.0     # ...and only if it is still listed this long after the first close
+    key_check_s: float = 600.0       # session-key renewal check, between cycles only
+    stake_track_s: float = 10.0
     settle_s: float = 5.0
     idle_retry_s: float = 60.0
     stray_retry_s: float = 15.0
@@ -265,6 +268,10 @@ class Bot:
                 self._say_once("J'attends l'expiration des ordres du cycle précédent avant d'en ouvrir d'autres")
             return
         self.st["next_try"] = now + self.t.idle_retry_s
+        maintain = getattr(self.v, "maintain_keys", None)
+        if maintain and now >= self.st.get("next_key_check", 0):
+            self.st["next_key_check"] = now + self.t.key_check_s
+            maintain()   # no pair is open here: a renewal can never leave a close unsigned
         if self.st.get("paused"):
             self._say_once(f"En pause: {self.st['paused']}")
             return
@@ -366,6 +373,13 @@ class Bot:
             for p in listed.values():
                 if p.id in self._known(w) or p.coin not in (None, c["coin"]) or p.is_long not in (None, IS_LONG[w]):
                     continue
+                # Not this cycle's order (e.g. a late fill of an earlier one): swept below. Values far
+                # off (a unit the parser misreads) are ignored rather than closing the bot's own leg.
+                ratio = p.margin / c["margin"] if p.margin else 1.0
+                wrong_margin = 0.5 <= ratio <= 2 and abs(ratio - 1) > 0.02
+                wrong_leverage = p.leverage is not None and 1 <= p.leverage <= 1000 and p.leverage != c["leverage"]
+                if wrong_margin or wrong_leverage:
+                    continue
                 self._remember(w, p.id)
                 leg["pos_id"] = p.id
                 # Unknown entry: assume the worst price seen since the order was sent.
@@ -422,19 +436,41 @@ class Bot:
             self.st["phase"] = "idle"
             return
         equity_now = sum(self.v.usdc(w) + self.v.queued(w) for w in WALLETS)   # read before changing the state
+        self._cancel_pending(c)
         self.st["cycle"] = None
         self.st["phase"] = "idle"
         if c["equity_start"] - equity_now >= 0.5 * c["margin"]:
             self.pause("les soldes ont baissé mais aucune position n'est visible via l'API: des positions "
                        "sont sans doute ouvertes. Vérifiez sur le site et lancez `python -m ptbot probe`")
             return
-        log.warning("Aucune jambe exécutée avant l'expiration des ordres")
-        self._open_failed(c, "ordres acceptés mais jamais exécutés")
+        # Accepted orders that never execute are abnormal (relayer queue, refused size or leverage,
+        # or positions the bot cannot see): stop at the first occurrence.
+        self.pause("ordres acceptés mais jamais exécutés avant leur échéance: vérifiez sur le site "
+                   "(file d'attente du relayer ? positions invisibles ?) puis `resume`")
 
     def _abort(self, now: float, wallets: list[str]) -> None:
         self.st["cycle"]["aborted"] = True
+        self._cancel_pending(self.st["cycle"])
         self._send_close(now, wallets)
         self.st["phase"] = "closing"
+
+    def _cancel_pending(self, c: dict) -> None:
+        """Best effort: kill the orders of legs not seen yet. The bot keeps watching for them
+        until they expire anyway, in case the cancellation does not go through."""
+        cancel = getattr(self.v, "cancel", None)
+        for w in WALLETS:
+            leg = c["legs"][w]
+            if not cancel or leg["pos_id"] is not None or leg["status"] not in MAYBE_EXECUTED or not leg["intent"]:
+                continue
+            if leg.get("cancel_sent"):
+                continue
+            leg["cancel_sent"] = True
+            try:
+                cancel(w, leg["intent"])
+                log.info("Wallet %s: ordre %s annulé", w, leg["intent"])
+            except Exception as e:
+                log.warning("Wallet %s: annulation de l'ordre %s impossible (%s), je surveille jusqu'à son échéance",
+                            w, leg["intent"], e)
 
     # --- open: watch the price, close both legs before liquidation --------
     def _open(self, now: float) -> None:
@@ -480,6 +516,7 @@ class Bot:
             if leg["pos_id"] is None:
                 continue
             leg["close_sends"] += 1
+            leg.setdefault("first_close_at", now)
             try:
                 self.v.close(w, [leg["pos_id"]])
             except Exception as e:
@@ -526,12 +563,13 @@ class Bot:
             if self._should_resend(c, visible, mid, now):
                 log.warning("Toujours ouvert sur %s: je renvoie la fermeture", visible)
                 self._send_close(now, visible)
-            if sends >= self.t.max_close_sends and not c.get("ghost_paused"):
+            first = min(c["legs"][w].get("first_close_at", now) for w in visible)
+            if sends >= self.t.max_close_sends and now - first >= self.t.ghost_after_s and not c.get("ghost_paused"):
                 c["ghost_paused"] = True
                 self.pause(f"positions {[c['legs'][w]['pos_id'] for w in visible]} toujours listées après "
                            f"{sends} fermetures. Si le site les montre fermées, l'API est mal lue; sinon fermez-les "
                            "à la main", kind="ghost")
-        if visible or unconfirmed or waiting:
+        if visible or unconfirmed or waiting or self.st["strays"]:
             c["settle_at"] = None
             return
         if c["settle_at"] is None:
@@ -603,6 +641,9 @@ class Bot:
     # --- staking --------------------------------------------------------
     def _track_stakes(self, now: float) -> None:
         pending = self.st["pending_stakes"]
+        if not pending or now < self.st.get("next_stake_track", 0):
+            return
+        self.st["next_stake_track"] = now + self.t.stake_track_s
         for w in list(pending):
             ps = pending[w]
             # Dropped by at least half the stake: executed, even if some PAPER was minted meanwhile.
@@ -653,6 +694,7 @@ class Bot:
                 log.warning("Stake sur %s: pas de réponse claire (%s), je vérifie on-chain", w, e)
                 continue
             log.info("Wallet %s: stake de %s PAPER envoyé", w, f"{raw / SCALE:,.0f}")
+        self.st["next_stake_track"] = 0
         self._track_stakes(now)
 
     # --- rebalancing: A <-> B through HyperCore -----------------------------

@@ -38,12 +38,18 @@ STAKE_DEADLINE_S = 300
 WITHDRAW_DEADLINE_S = 600
 
 FEE_ADDRESS = "0x0000000000000000000000000000000000000000"
-SESSION_KEY_LIFETIME_S = 30 * 24 * 3600
+# The website bundle asks for 30-day keys but the protocol docs say a key lasts 7 days:
+# ask for 6 and renew 2 days before expiry (only between cycles).
+SESSION_KEY_LIFETIME_S = 6 * 24 * 3600
+SESSION_KEY_RENEW_S = 2 * 24 * 3600
+REGISTER_DEADLINE_S = 3600
 
 DOMAIN_EXCHANGE = {"name": "String", "version": "1", "chainId": CHAIN_ID,
                    "verifyingContract": EXCHANGE_CONTRACT}
 DOMAIN_STAKING = {"name": "PaperStaking", "version": "1", "chainId": CHAIN_ID,
                   "verifyingContract": PAPER_STAKING}
+DOMAIN_CANCEL = {"name": "PaperTrade Intent Cancel", "version": "2", "chainId": CHAIN_ID,
+                 "verifyingContract": EXCHANGE_CONTRACT}
 
 INTENT_TYPES = {
     "RegisterSessionKey": [
@@ -87,6 +93,11 @@ INTENT_TYPES = {
         {"name": "nonce", "type": "uint256"},
         {"name": "deadline", "type": "uint64"},
     ],
+    "CancelIntent": [
+        {"name": "user", "type": "address"},
+        {"name": "intentId", "type": "bytes32"},
+        {"name": "deadline", "type": "uint256"},
+    ],
 }
 
 # Which domain signs which intent, and the action name POSTed to /intents.
@@ -97,6 +108,7 @@ INTENT_DOMAIN_KEY = {
     "WithdrawToCore": "exchange",
     "Stake": "staking",
     "Claim": "staking",
+    "CancelIntent": "cancel",
 }
 INTENT_ACTION = {
     "RegisterSessionKey": "registerSessionKey",
@@ -105,4 +117,5 @@ INTENT_ACTION = {
     "WithdrawToCore": "withdrawToCore",
     "Stake": "paperStake",
     "Claim": "paperClaim",
+    "CancelIntent": "cancelIntent",  # posted to /intents/{id}/cancel without the action wrapper
 }

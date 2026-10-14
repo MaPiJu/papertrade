@@ -21,6 +21,7 @@ class Settings:
     rpc_url: str
     hl_url: str
     use_session_key: bool
+    open_deadline_s: int
 
 
 def _f(name: str, default: float) -> float:
@@ -70,4 +71,5 @@ def load_settings(env_file: str = ".env", need_keys: bool = True) -> Settings:
         rpc_url=os.getenv("HYPEREVM_RPC", HYPEREVM_RPC),
         hl_url=os.getenv("HYPERLIQUID_API", HL_API),
         use_session_key=os.getenv("USE_SESSION_KEY", "true").lower() in ("1", "true", "yes", "oui"),
+        open_deadline_s=int(_f("OPEN_DEADLINE_S", 120)),
     )

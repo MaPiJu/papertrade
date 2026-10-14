@@ -26,8 +26,28 @@ def test_nested_and_string_sides():
     assert [(p.id, p.coin, p.is_long) for p in pos] == [(5, "ETH", False)]
 
 
-def test_items_without_position_id_are_ignored():
-    assert open_positions({"items": [{"type": "deposit", "amount": "5"}]}) == []
+def test_unreadable_events_fail_closed():
+    import pytest
+    with pytest.raises(ValueError):            # events without any position id: format not understood
+        open_positions({"items": [{"type": "deposit", "amount": "5"}]})
+    with pytest.raises(ValueError):            # ids but no event kind the parser understands
+        open_positions({"items": [{"positionId": 1, "foo": "bar"}]})
+    assert open_positions({"items": []}) == []
+    mixed = {"items": [{"type": "deposit"}, {"positionId": 3, "type": "open", "isLong": True}]}
+    assert [p.id for p in open_positions(mixed)] == [3]
+
+
+def test_more_event_shapes():
+    hl_style = [{"positionId": "7", "dir": "Open Long", "coin": "BTC"},
+                {"positionId": "8", "dir": "Open Short", "coin": "BTC"},
+                {"positionId": "8", "dir": "Close Short", "coin": "BTC"}]
+    assert [(p.id, p.is_long) for p in open_positions(hl_style)] == [(7, True)]
+    zero_exit = [{"positionId": 9, "type": "open", "isLong": False, "exitPrice": "0.0"}]
+    assert [p.id for p in open_positions(zero_exit)] == [9]       # "0.0" is not a close
+    bust = [{"positionId": 4, "type": "open", "isLong": True}, {"positionId": 4, "type": "bust"}]
+    assert open_positions(bust) == []
+    hex_ids = [{"positionId": "0x1a", "type": "open", "side": "long"}]
+    assert [p.id for p in open_positions(hex_ids)] == [26]
 
 
 def test_plausible_price_finds_the_scale():

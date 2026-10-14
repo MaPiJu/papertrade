@@ -342,7 +342,9 @@ def test_ghost_position_in_closing_pauses(tmp_path):
     real = venue.positions
     ghost = store.data["cycle"]["legs"]["A"]["pos_id"]
     venue.positions = lambda w: [Position(ghost, "BTC", True)] + real(w) if w == "A" else real(w)
-    run_for(bot, 600)
+    run_for(bot, 300)
+    assert not store.data["paused"]        # a slow relayer queue is not a ghost yet
+    run_for(bot, 400)
     assert store.data["paused"] and "toujours listées" in store.data["paused"]
 
 
@@ -421,7 +423,7 @@ def test_ghost_pause_lifts_itself_when_the_position_finally_disappears(tmp_path)
     real = venue.positions
     ghost = store.data["cycle"]["legs"]["A"]["pos_id"]
     venue.positions = lambda w: [Position(ghost, "BTC", True)] + real(w) if w == "A" else real(w)
-    run_for(bot, 200)
+    run_for(bot, 700)
     assert store.data["paused"]
     venue.positions = real                 # the indexer catches up
     run_for(bot, 60)
@@ -435,3 +437,98 @@ def test_reset_costs_forgets_the_cumulative_baseline():
     st = {"history": [1], "cycles_all": [1], "equity_first": 300.0, "strays": {}}
     apply_resume(st, reset_costs=True)
     assert st["history"] == [] and st["cycles_all"] == [] and "equity_first" not in st
+
+
+# --- live-realism findings --------------------------------------------------------
+
+def test_a_late_fill_of_another_size_is_never_adopted_as_a_leg(tmp_path):
+    # B's own order fills 30 s late; meanwhile an earlier, differently sized order fills on B
+    venue, store, bot = make(tmp_path, [(0, 100_000)], {("open", "B"): {"delay": 30}}, usdc=200,
+                             params=Params(max_margin_usd=100))
+    bot.step()                                                    # the pair's orders are sent
+    assert store.data["phase"] == "opening"
+    SimVenue.open(venue, "B", "BTC", False, 60.0, 200, 120)      # the earlier order's late fill
+    stray = max(venue.accounts["B"].positions)
+    run_for(bot, 60)
+    leg_b = store.data["cycle"]["legs"]["B"]
+    assert leg_b["pos_id"] != stray                              # not adopted as the cycle's short
+    assert venue.accounts["B"].positions[leg_b["pos_id"]].margin == 100
+    assert stray not in venue.accounts["B"].positions             # closed as a stray
+
+
+def test_cycle_is_not_booked_while_a_stray_is_still_open(tmp_path):
+    venue, store, bot = make(tmp_path, [(0, 100_000), (60, 100_750)], usdc=200, params=Params(max_margin_usd=150))
+    run_for(bot, 55)
+    SimVenue.open(venue, "A", "BTC", True, 30.0, 400, 120)        # an unmanaged position appears
+    venue.close_noops = 0
+    real_close = venue.close
+    stray_id = max(venue.accounts["A"].positions)
+
+    def slow_close(w, ids):                                       # the stray takes a while to close
+        if stray_id in ids and venue.now() < 1_800_000_000 + 200:
+            return "queued"
+        return real_close(w, ids)
+
+    venue.close = slow_close
+    run_for(bot, 120)
+    assert store.data["totals"]["cycles"] == 0                    # waits: the stray's margin is not cycle cost
+    run_for(bot, 200)
+    assert store.data["totals"]["cycles"] == 1
+    assert not store.data.get("paused")
+
+
+def test_pending_orders_are_cancelled_when_a_pair_is_abandoned(tmp_path):
+    cancelled = []
+
+    class Cancelling(FaultVenue):
+        def cancel(self, w, intent_id):
+            cancelled.append((w, intent_id))
+
+    venue = Cancelling(Path([(0, 100_000), (20, 99_250)]), faults={("open", "B"): {"never": True}},
+                       start_usdc=100, emission=50)
+    store = StateStore(tmp_path / "state.json")
+    bot = Bot(venue, Params(), store, Timing())
+    run_for(bot, 40)                                              # A alone hits its exit: pair abandoned
+    assert cancelled == [("B", "accepted")]
+
+
+def test_orders_that_never_execute_pause_at_once(tmp_path):
+    venue, store, bot = make(tmp_path, [(0, 100_000)],
+                             {("open", "A"): {"never": True}, ("open", "B"): {"never": True}})
+    run_for(bot, 300)
+    assert store.data["paused"] and "jamais exécutés" in store.data["paused"]
+    assert venue.calls["open", "A"] == 1
+
+
+def test_oldest_first_feed_is_followed_to_its_end_and_cached():
+    from ptbot.papertrade_api import PaperTradeApi
+
+    events = [{"positionId": i // 2, "type": "open" if i % 2 == 0 else "close", "timestamp": 1000 + i}
+              for i in range(70)] + [{"positionId": 99, "type": "open", "isLong": True, "timestamp": 2000}]
+    pages = [events[i:i + 20] for i in range(0, len(events), 20)]
+    calls = []
+
+    api = PaperTradeApi("http://unused")
+
+    def fake_get(path, params=None, timeout=None, retry=True):
+        n = int((params or {}).get("cursor") or 0)
+        calls.append(n)
+        return {"items": pages[n], "nextCursor": str(n + 1) if n + 1 < len(pages) else None}
+
+    api.get = fake_get
+    from ptbot.positions import open_positions
+    assert [p.id for p in open_positions(api.account_trades("0xabc"))] == [99]   # page 4 of 4 is read
+    assert api.trades_order("0xabc") == "asc"
+    calls.clear()
+    api.account_trades("0xabc")
+    assert calls == [3]                                           # full pages come from the cache
+
+
+def test_a_misread_margin_unit_does_not_make_the_bot_close_its_own_leg(tmp_path):
+    venue, store, bot = make(tmp_path, [(0, 100_000)])
+    real = venue.positions
+    venue.positions = lambda w: [Position(p.id, p.coin, p.is_long, p.margin * 1e6, p.leverage, p.entry)
+                                 for p in real(w)]              # margin read in the wrong unit
+    run_for(bot, 30)
+    assert store.data["phase"] == "open"
+    assert all(len(a.positions) == 1 for a in venue.accounts.values())

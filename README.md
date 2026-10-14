@@ -26,16 +26,18 @@ idle ──► (rééquilibrage A⇄B si besoin) ──► ouverture long A + sh
   viennent de la rétro-ingénierie du site par la communauté (10/10/2026). Ils peuvent changer sans prévenir.
   Le bot vérifie ce qu'il peut (domaines EIP-712 on-chain, minimums via `/state/trading`), mais **la lecture des
   positions ouvertes (`/query/accounts/{adresse}/trades`) n'a jamais pu être testée en conditions réelles** :
-  lancez `probe` avant tout (voir plus bas).
-- **Conditions d'utilisation.** En phase 1, PaperTrade réserve le trading au site et à des relayers whitelistés.
-  Le bot envoie les mêmes intents signés que le site, au même relayer, mais automatiser peut être contraire aux
-  CGU : c'est votre risque.
+  suivez la mise en route ci-dessous, `run` refuse de démarrer sans les mini-positions de test.
+- **Conditions d'utilisation.** En phase 1, PaperTrade réserve le trading au site et à des relayers whitelistés,
+  et contourner le site « expose à une exclusion ». Le bot envoie les mêmes intents signés que le site, au même
+  relayer, en s'identifiant honnêtement, mais c'est de l'automatisation : c'est votre risque.
 - **Capital et notionnel minimum.** Une position doit faire au moins 10 000 $ de notionnel. Avec 100 $ par wallet
   en x100, vous êtes **pile au minimum** : après le premier cycle (~9 $ de coût en simulation), les soldes
   repassent sous 100 $ et le bot ne peut plus ouvrir en x100. Il l'affiche et attend. Pour enchaîner les cycles,
   il faut soit plus d'USDC (150 $/wallet ≈ 2 à 9 cycles selon le haircut réel, 250 $/wallet environ le double), soit
   autoriser le levier à monter (`MAX_LEVERAGE=150` ou 200), ce qui rapproche la liquidation. Dans tous les cas,
-  ~100 $ par wallet restent immobilisés comme marge minimale : seul l'excédent est « brûlé » pour minter.
+  ~100 $ par wallet restent immobilisés comme marge minimale : seul l'excédent est « brûlé » pour minter. Et si la
+  file d'attente des profits de PaperTrade est active, le gain de la jambe gagnante n'est pas disponible tout de
+  suite : à 150 $/wallet, un seul cycle passe avant que les soldes retombent sous le minimum.
 - **Le coût par PAPER a augmenté.** rusk0f s'est arrêté quand un cycle dépassait 7 $/1 000 PAPER. Si l'émission
   actuelle est déjà basse, le plafond se déclenchera vite. `python -m ptbot plan` l'estime avant de lancer.
 - **Risques du protocole.** Contrats non vérifiés et upgradables, LP unique, profits mis en file d'attente si la
@@ -63,19 +65,56 @@ aussi exister sur Hyperliquid (HyperCore), puisque le rééquilibrage passe par 
 
 ## Mise en route (dans cet ordre)
 
-1. **`python -m ptbot probe`** (lecture seule). Affiche et enregistre dans `data/probe/probe.json` : soldes
-   PaperTrade, PAPER, soldes HyperCore, adresses de dépôt (.env vs API), domaines EIP-712 on-chain, minimums,
-   émission, et **les positions ouvertes telles que le bot les comprend**.
-   Ouvrez une petite position à la main sur le site, relancez `probe`, et vérifiez qu'elle apparaît dans
-   `open_positions_parsed`. Si elle n'apparaît pas, le format de l'API diffère de celui prévu dans
-   `ptbot/positions.py` : envoyez-moi le contenu de `trades_raw_first_page` et j'adapte le parseur.
-2. **`python -m ptbot sim --hours 72 --usdc 100`** : la stratégie en simulation hors-ligne (prix synthétiques,
-   haircut et émission estimés). `--live-prices` utilise les vrais prix Hyperliquid en temps réel.
-3. **`python -m ptbot plan`** : ce que le bot ferait maintenant (rééquilibrage, marge, levier, coût estimé).
-4. **`python -m ptbot register`** : enregistre une session key par wallet (comme le site). Si c'est refusé
-   (`403 unauthorized_intent`), les types EIP-712 ont changé : ne lancez pas `run`.
-5. **`python -m ptbot run`** : lance le bot (confirmation demandée ; `--yes` pour `nohup`/systemd). Surveillez
-   le premier cycle sur le site.
+Le bot n'a jamais pu parler au vrai PaperTrade pendant son développement : l'API n'est pas documentée et le format
+exact de plusieurs réponses est deviné. Cette procédure vérifie chaque hypothèse **avec au plus 10 $ en jeu par
+wallet** avant de lui confier 150 $. `python -m ptbot run` refuse de démarrer tant que les étapes 6 et 8 n'ont pas
+réussi (session keys, mini-positions de test) et tant que l'horloge, les adresses de dépôt ou `balances()` ne sont
+pas conformes.
+
+0. **Décidez du risque de la phase 1.** Pour l'instant PaperTrade réserve le trading au site et à des relayers
+   autorisés ; contourner le site « expose à une exclusion ». Le bot envoie les mêmes ordres signés que le site,
+   mais c'est de l'automatisation. Si vous ne voulez pas risquer A et B, arrêtez-vous là et tradez à la main en
+   suivant `python -m ptbot plan`.
+1. **Machine** : horloge synchronisée (NTP : `timedatectl set-ntp true`), qui ne se met pas en veille. Deux wallets
+   dédiés, chacun avec ses USDC sur PaperTrade et un compte HyperCore existant. Une alerte que vous verrez vraiment :
+   `tail -F data/bot.log | grep --line-buffered -E 'PAUSE|ERROR|refus'` vers une notification. Une pause avec une
+   paire ouverte demande d'agir en quelques minutes.
+2. **Contrôle en lecture seule** (sans clé, rien n'est dépensé) :
+   `python tools/preflight_live.py --wallet-a <A> --wallet-b <B> --deposit-a <DEPOSIT_A> --deposit-b <DEPOSIT_B>`.
+   Tout `FAIL` est bloquant. Il faut notamment : décalage d'horloge < 5 s, `eip712Domain()` lisible (notez le nom
+   du domaine), minimums `(10.0, 10000.0)`, sur les comptes publics `ids N/N` sans `unknown`, `balances() return
+   size 32 bytes`, adresses de dépôt API = `.env`. Si `profit queue` est actif, `userQueuedTotal` doit être lisible.
+3. **`python -m ptbot probe`**, puis ouvrez `data/probe/probe.json` : domaines lus (pas `null`), soldes égaux à
+   ceux du site, `usdc_queued` est un nombre, `trades_order`, `open_positions_parsed` vide si vous n'avez rien
+   d'ouvert.
+4. **Position manuelle sur le site** (bot arrêté, avant d'enregistrer la clé du bot) : sur A, la plus petite
+   position possible (10 $ x1000). Pendant qu'elle est ouverte, relancez `probe` : `open_positions_parsed` doit la
+   contenir (bon id, BTC, sens, prix d'entrée) et `usdc_papertrade` doit avoir baissé d'environ 10 $. Fermez-la (ou
+   laissez-la liquider) et relancez `probe` : elle doit avoir disparu. **Sinon, n'allez pas plus loin** et
+   envoyez-moi `trades_raw_first_page` pour adapter `ptbot/positions.py`.
+5. **Aller-retour manuel de 5 à 10 $** : retirez de A vers HyperCore sur le site (notez s'il faut une deuxième
+   étape, les frais, spot ou perp, la durée), puis envoyez-les vers l'adresse de dépôt de B. Si le crédit prend plus
+   d'une heure, le bot se mettra en pause pendant ses rééquilibrages.
+6. **`python -m ptbot register`** (bot arrêté) puis attendez 5 minutes. Refus « signature » : le format a changé,
+   n'allez pas plus loin. Refus « origin/cookie » : le relayer refuse les clients hors site, arrêtez-vous.
+7. **Ne réactivez pas le trading sur le site** pour A ou B ensuite : si le site enregistre sa propre clé, celle du
+   bot peut être révoquée (le bot en réenregistre une, mais une fermeture peut échouer entre-temps). Si vous l'avez
+   fait, relancez `register`.
+8. **Mini-position signée par le bot** (perte maximale 10 $ par wallet) :
+   `python tools/preflight_tiny_trade.py --wallet A` (à blanc), puis
+   `python tools/preflight_tiny_trade.py --wallet A --i-understand-this-trades`, et pareil pour B. Toutes les
+   lignes doivent être `PASS` ; notez les latences. Si l'ouverture met plus de 60 s ou la fermeture plus de 30 s,
+   baissez `CLOSE_MOVE_PCT` (0,60) ou montez `OPEN_DEADLINE_S` avant d'aller plus loin.
+9. **`python -m ptbot plan`** : marge, x100, sortie ±0,70 % contre liquidation ±0,95 %, émission, coût estimé.
+10. **Premier lancement réduit** : `MAX_MARGIN_USD=100` dans `.env`, puis `python -m ptbot run` et
+    `tail -f data/bot.log`. Surveillez avec `python -m ptbot status` (pas avec le site). Vérifiez la ligne
+    « Paire ouverte (A …, B …) », l'absence de « refusé », le temps entre « fermeture des deux jambes » et la
+    disparition des positions, puis le premier rééquilibrage de bout en bout.
+11. **Après au moins 3 cycles propres** (coûts et PAPER cohérents avec le site), retirez `MAX_MARGIN_USD`.
+    Refaites l'étape 2 après toute mise à jour de PaperTrade (contrats upgradables).
+
+**Procédure d'urgence** : créez le fichier `STOP`, attendez l'arrêt du bot, fermez les deux jambes (`close-all`,
+ou sur le site, puis `register` avant de relancer). `close-all` refuse de tourner pendant que le bot tourne.
 
 ## Commandes
 
@@ -134,6 +173,7 @@ le fausserait. `stake-now` refuse tant qu'un cycle est en cours ; arrêtez d'abo
 | `REBALANCE_THRESHOLD_PCT` / `MIN_REBALANCE_USD` | 10 / 5 | quand rééquilibrer |
 | `STAKE_THRESHOLD_PAPER` | 1000 | seuil de staking automatique |
 | `MAX_COST_PER_1000_PAPER` / `COST_WINDOW` | 7 / 1 | arrêt dès qu'un cycle (ou la moyenne de N cycles) dépasse le plafond |
+| `OPEN_DEADLINE_S` | 120 | durée de validité d'un ordre d'ouverture (à monter si le relayer est lent) |
 
 Un `CLOSE_MOVE_PCT` plus grand coûte moins cher par PAPER (le haircut baisse quand le mouvement grandit), mais
 laisse moins de marge avant la liquidation, et les cycles durent plus longtemps.
@@ -141,8 +181,11 @@ laisse moins de marge avant la liquidation, et les cycles durent plus longtemps.
 ## Comment ça marche techniquement
 
 - **Ordres** : intents EIP-712 signés localement et envoyés à `POST https://exchange.papertrade.xyz/intents`
-  (gasless). Ouverture/fermeture signées par une session key enregistrée par le wallet ; stake et retrait
-  signés par le wallet principal.
+  (gasless). Ouverture/fermeture signées par une session key enregistrée par le wallet ; stake, retrait et
+  annulation signés par le wallet principal. Les session keys sont demandées pour 6 jours et renouvelées entre deux
+  cycles, 2 jours avant leur échéance. Les 4 clés précédentes encore valides sont gardées en secours (si le relayer
+  traîne, celle qu'il active n'est pas forcément la dernière) ; une clé refusée en pleine fermeture déclenche un
+  nouvel enregistrement, au plus un par minute.
 - **Prix** : BBO mid Hyperliquid (`l2Book`), le même prix que PaperTrade utilise pour ouvrir et fermer.
 - **Soldes** : lus on-chain sur HyperEVM (`balances(address)` de l'Exchange, `balanceOf` du token PAPER).
 - **Rééquilibrage** : intent `withdrawToCore` du wallet riche → USDC sur HyperCore → `spotSend` vers l'adresse de

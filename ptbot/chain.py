@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+import time
 
 import requests
 from eth_abi import decode, encode
@@ -26,17 +27,33 @@ class HyperEvm:
         self.timeout = timeout
         self.http = requests.Session()
 
-    def call(self, to: str, signature: str, arg_types: list[str], args: list, out_types: list[str]):
-        data = selector(signature) + encode(arg_types, args)
-        payload = {"jsonrpc": "2.0", "id": 1, "method": "eth_call",
-                   "params": [{"to": to_checksum_address(to), "data": "0x" + data.hex()}, "latest"]}
-        r = self.http.post(self.rpc_url, json=payload, timeout=self.timeout)
+    def rpc(self, method: str, params: list):
+        r = self.http.post(self.rpc_url, json={"jsonrpc": "2.0", "id": 1, "method": method, "params": params},
+                           timeout=self.timeout)
         r.raise_for_status()
         body = r.json()
         if "error" in body:
-            raise ContractCallError(f"eth_call {signature}: {body['error']}")
-        raw = bytes.fromhex(body["result"][2:])
-        return decode(out_types, raw)
+            raise ContractCallError(f"{method}: {body['error']}")
+        return body["result"]
+
+    def call_raw(self, to: str, signature: str, arg_types: list[str], args: list) -> bytes:
+        data = selector(signature) + encode(arg_types, args)
+        try:
+            result = self.rpc("eth_call", [{"to": to_checksum_address(to), "data": "0x" + data.hex()}, "latest"])
+        except ContractCallError as e:
+            raise ContractCallError(f"eth_call {signature}: {e}") from None
+        return bytes.fromhex(result[2:])
+
+    def call(self, to: str, signature: str, arg_types: list[str], args: list, out_types: list[str]):
+        return decode(out_types, self.call_raw(to, signature, arg_types, args))
+
+    def balances_return_size(self, user: str) -> int:
+        """balances(address) must return one 32-byte word (free collateral). A struct would be
+        silently read as its first field."""
+        return len(self.call_raw(EXCHANGE_CONTRACT, "balances(address)", ["address"], [to_checksum_address(user)]))
+
+    def block_time(self) -> int:
+        return int(self.rpc("eth_getBlockByNumber", ["latest", False])["timestamp"], 16)
 
     # --- PaperTrade reads ------------------------------------------------
     def usdc_balance(self, user: str) -> float:
@@ -69,14 +86,30 @@ class HyperEvm:
         return 100.0 * (120e6 / (120e6 + tail / SCALE)) ** 2
 
     def eip712_domain(self, contract: str) -> dict | None:
-        """EIP-5267 `eip712Domain()`: the domain the contract really verifies against."""
-        try:
-            _, name, version, chain_id, verifying, _, _ = self.call(
-                contract, "eip712Domain()", [], [],
-                ["bytes1", "string", "string", "uint256", "address", "bytes32", "uint256[]"])
-        except Exception as e:  # contract may not implement EIP-5267
-            log.debug("eip712Domain() unavailable on %s: %s", contract, e)
-            return None
+        """EIP-5267 `eip712Domain()`: the domain the contract really verifies against.
+        None only when the contract does not implement it (revert); a network error is
+        retried, then raised: guessing the domain would make every signature invalid."""
+        for attempt in range(3):
+            try:
+                fields, name, version, chain_id, verifying, _, _ = self.call(
+                    contract, "eip712Domain()", [], [],
+                    ["bytes1", "string", "string", "uint256", "address", "bytes32", "uint256[]"])
+                break
+            except ContractCallError as e:
+                if "revert" in str(e).lower():
+                    log.debug("eip712Domain() absent on %s: %s", contract, e)
+                    return None
+                error = e
+            except requests.RequestException as e:
+                error = e
+            except Exception as e:   # empty or malformed return: the function does not exist
+                log.debug("eip712Domain() absent on %s: %s", contract, e)
+                return None
+            time.sleep(1 + 2 * attempt)
+        else:
+            raise RuntimeError(f"eip712Domain() illisible sur {contract} ({error}): réessayez plus tard")
+        if fields != b"\x0f":
+            raise RuntimeError(f"eip712Domain() de {contract}: champs 0x{fields.hex()} non gérés (attendu 0x0f)")
         return {"name": name, "version": version, "chainId": chain_id, "verifyingContract": verifying.lower()}
 
 

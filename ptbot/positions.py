@@ -13,7 +13,7 @@ from typing import Any, Iterable
 from .constants import INSTRUMENTS, SCALE
 
 ID_KEYS = ("positionId", "position_id", "posId", "positionID")
-KIND_KEYS = ("kind", "type", "event", "eventType", "action", "status", "reason")
+KIND_KEYS = ("kind", "type", "event", "eventType", "action", "status", "reason", "dir")
 CLOSED_MARKERS = ("closedAt", "closeTime", "closedTime", "exitPrice", "closePrice", "closeTs")
 COIN_KEYS = ("instrumentId", "instrument", "marketId", "market", "coin", "asset", "symbol")
 SIDE_BOOL_KEYS = ("isLong", "long")
@@ -90,21 +90,27 @@ def _side(rec: dict) -> bool | None:
         return b
     if isinstance(b, str) and b.lower() in ("true", "false"):
         return b.lower() == "true"
-    s = _first(rec, SIDE_STR_KEYS)
-    if isinstance(s, str):
+    for key in SIDE_STR_KEYS + ("dir",):
+        s = rec.get(key)
+        if not isinstance(s, str):
+            continue
         s = s.lower()
-        if s in ("long", "buy", "l", "b"):
+        if s in ("long", "buy", "l", "b") or "long" in s:
             return True
-        if s in ("short", "sell", "s", "a"):
+        if s in ("short", "sell", "s", "a") or "short" in s:
             return False
     return None
 
 
+def _present(v: Any) -> bool:
+    return v not in (None, "") and _num(v) != 0
+
+
 def _kind(rec: dict) -> str:
     text = " ".join(str(rec[k]).lower() for k in KIND_KEYS if isinstance(rec.get(k), str))
-    if "liquid" in text or any(rec.get(k) not in (None, "", 0, "0") for k in CLOSED_MARKERS):
+    if any(_present(rec.get(k)) for k in CLOSED_MARKERS):
         return "closed"
-    if any(w in text for w in ("close", "exit", "settle", "cancel")):
+    if any(w in text for w in ("liquid", "bust", "adl", "deleverag", "close", "exit", "settle", "cancel")):
         return "closed"
     if "open" in text:
         return "open"
@@ -112,16 +118,21 @@ def _kind(rec: dict) -> str:
 
 
 def open_positions(payload: Any) -> list[Position]:
-    """Positions with an open event and no close/liquidation event."""
+    """Positions with an open event and no close/liquidation event. Fails closed: events
+    that the parser cannot read raise instead of reading as "no position"."""
     opened: dict[int, Position] = {}
     closed: set[int] = set()
-    for rec in _records(payload):
+    records = list(_records(payload))
+    with_id = known_kind = 0
+    for rec in records:
         pid = _first(rec, ID_KEYS)
         try:
-            pid = int(pid)
+            pid = int(pid, 16) if isinstance(pid, str) and pid.lower().startswith("0x") else int(pid)
         except (TypeError, ValueError):
             continue
+        with_id += 1
         kind = _kind(rec)
+        known_kind += kind != "unknown"
         if kind == "closed":
             closed.add(pid)
         elif kind == "open":
@@ -134,6 +145,9 @@ def open_positions(payload: Any) -> list[Position]:
                 leverage=int(lev) if lev else None,
                 entry=_num(_first(rec, ENTRY_KEYS)),
             )
+    if records and (not with_id or not known_kind):
+        raise ValueError(f"format des événements non reconnu ({len(records)} événements, {with_id} avec un id de "
+                         f"position, {known_kind} classés): lancez `python -m ptbot probe` et adaptez positions.py")
     return [p for pid, p in opened.items() if pid not in closed]
 
 

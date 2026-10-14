@@ -15,14 +15,29 @@ from pathlib import Path
 from eth_account import Account
 
 from .chain import ContractCallError, HyperEvm
-from .constants import (FEE_ADDRESS, INSTRUMENTS, SCALE, SESSION_KEY_LIFETIME_S, STAKE_DEADLINE_S,
-                        WITHDRAW_DEADLINE_S)
+from .constants import (FEE_ADDRESS, INSTRUMENTS, REGISTER_DEADLINE_S, SCALE, SESSION_KEY_LIFETIME_S,
+                        SESSION_KEY_RENEW_S, STAKE_DEADLINE_S, WITHDRAW_DEADLINE_S)
 from .hyperliquid import HyperliquidInfo, HyperliquidTransfers
-from .papertrade_api import PaperTradeApi
+from .papertrade_api import IntentRejected, PaperTradeApi
 from .positions import Position, open_positions
 from .signing import NonceSource, build_intent
 
 log = logging.getLogger(__name__)
+
+AUTH_WORDS = ("401", "403", "unauthor", "forbidden", "session", "signer", "signature", "not registered")
+
+
+def _auth_refusal(e: Exception) -> bool:
+    """A refusal that a fresh session key might fix (expired, revoked or not yet active)."""
+    return any(w in str(e).lower() for w in AUTH_WORDS)
+
+
+MAX_OLD_KEYS = 4   # older session keys kept as fallbacks while still valid
+
+
+def _older_keys(entry: dict) -> list[dict]:
+    prev = entry.get("prev") or []
+    return [prev] if isinstance(prev, dict) else list(prev)
 
 
 @dataclass
@@ -52,6 +67,7 @@ class LiveVenue:
         self._minimums: tuple[float, float] | None = None
         self._minimums_at = 0.0
         self._queued_unsupported = False
+        self._last_register: dict[str, float] = {}
 
     # --- clock -----------------------------------------------------------
     def now(self) -> float:
@@ -81,6 +97,10 @@ class LiveVenue:
             self._queued_unsupported = True
             log.warning("userQueuedTotal() indisponible on-chain (%s): profits en file d'attente non comptés", e)
             return 0.0
+
+    @property
+    def queued_supported(self) -> bool:
+        return not self._queued_unsupported
 
     def paper_raw(self, w: str) -> int:
         return self.evm.paper_balance_raw(self.addr(w))
@@ -119,21 +139,46 @@ class LiveVenue:
         resp = self.api.submit(body)
         return str(resp.get("intentId", ""))
 
-    def _trading_key(self, w: str) -> str:
+    def _submit_trading(self, w: str, intent_type: str, fields: dict) -> str:
+        """Opens and closes are signed by the session key. If the relayer refuses it (expired,
+        revoked by the website's own key, renewal not active yet), the previous key is tried,
+        then a new key is registered for the bot's next attempt (it re-sends within seconds)."""
         if not self.use_session_key:
-            return self.wallets[w].private_key
-        return self.ensure_session_key(w)
+            return self._submit(self.wallets[w].private_key, intent_type, dict(fields, nonce=self.nonces.next()))
+        keys = self._usable_keys(w)
+        if not keys:
+            self._register(w, min_interval_s=60)
+            raise IntentRejected(f"wallet {w}: aucune session key valide, une nouvelle vient d'être demandée")
+        error: Exception | None = None
+        for key in keys:
+            try:
+                return self._submit(key, intent_type, dict(fields, nonce=self.nonces.next()))
+            except IntentRejected as e:
+                if not _auth_refusal(e):
+                    raise
+                error = e
+        log.error("Wallet %s: session key refusée (%s), j'en enregistre une nouvelle", w, error)
+        self._register(w, min_interval_s=60)
+        raise error
 
     def open(self, w: str, coin: str, is_long: bool, margin: float, leverage: int, deadline_s: int) -> str:
-        return self._submit(self._trading_key(w), "OpenPosition", {
+        return self._submit_trading(w, "OpenPosition", {
             "user": self.addr(w), "instrumentId": INSTRUMENTS[coin], "isLong": is_long,
             "size": int(round(margin * 100)) * SCALE // 100, "leverage": leverage, "useDebt": False,
-            "nonce": self.nonces.next(), "deadline": self._deadline(deadline_s)})
+            "deadline": self._deadline(deadline_s)})
 
     def close(self, w: str, position_ids: list[int]) -> str:
-        return self._submit(self._trading_key(w), "Close", {
-            "user": self.addr(w), "positionIds": position_ids,
-            "nonce": self.nonces.next(), "deadline": self._deadline(300)})
+        return self._submit_trading(w, "Close", {
+            "user": self.addr(w), "positionIds": position_ids, "deadline": self._deadline(300)})
+
+    def cancel(self, w: str, intent_id: str) -> None:
+        """Kills an order still waiting in the relayer queue (signed by the main wallet)."""
+        if not (isinstance(intent_id, str) and intent_id.startswith("0x") and len(intent_id) == 66):
+            raise ValueError(f"identifiant d'ordre inattendu: {intent_id!r}")
+        body = build_intent(self.wallets[w].private_key, "CancelIntent",
+                            {"user": self.addr(w), "intentId": intent_id, "deadline": self._deadline(300)},
+                            self.domains)
+        self.api.cancel(intent_id, body["signed"])
 
     def stake(self, w: str, amount_raw: int) -> str:
         return self._submit(self.wallets[w].private_key, "Stake", {
@@ -169,22 +214,63 @@ class LiveVenue:
         os.chmod(tmp, 0o600)
         tmp.replace(self._keys_file)
 
-    def ensure_session_key(self, w: str, force: bool = False) -> str:
-        """Same flow as the website: a local key, registered by the main wallet,
-        that can only open and close positions. Renewed 2 days before expiry."""
-        keys = self._load_keys()
-        entry = keys.get(self.addr(w).lower())
-        if entry and not force and entry["expiry"] - time.time() > 2 * 86400:
-            return entry["key"]
+    def _usable_keys(self, w: str) -> list[str]:
+        """The newest key, then the older ones still valid: a renewal may not be active yet, and
+        when the relayer lags, the key it ends up activating may not be the newest."""
+        entry = self._load_keys().get(self.addr(w).lower()) or {}
+        now = time.time()
+        return [k["key"] for k in [entry, *_older_keys(entry)] if k.get("key") and k.get("expiry", 0) - now > 60]
+
+    def key_expiry(self, w: str) -> float:
+        return (self._load_keys().get(self.addr(w).lower()) or {}).get("expiry", 0)
+
+    def _register(self, w: str, min_interval_s: float = 0) -> bool:
+        """Same flow as the website: a local key, registered by the main wallet, that can
+        only open and close positions. Older keys are kept as fallbacks until they expire."""
+        if time.time() - self._last_register.get(w, 0) < min_interval_s:
+            return False
+        self._last_register[w] = time.time()
         acct = Account.create()
         expiry = int(time.time()) + SESSION_KEY_LIFETIME_S
-        self._submit(self.wallets[w].private_key, "RegisterSessionKey", {
-            "user": self.addr(w), "key": acct.address, "expiry": expiry, "feeAddress": FEE_ADDRESS,
-            "nonce": self.nonces.next(), "deadline": self._deadline(600)})
         key_hex = acct.key.hex()
         key_hex = key_hex if key_hex.startswith("0x") else "0x" + key_hex
-        keys[self.addr(w).lower()] = {"key": key_hex, "address": acct.address, "expiry": expiry}
-        self._save_keys(keys)
-        log.info("Wallet %s: session key %s enregistrée (valide 30 jours)", w, acct.address)
-        time.sleep(5)  # let the relayer process the registration before the first trade
-        return keys[self.addr(w).lower()]["key"]
+        user = self.addr(w).lower()
+        keys = self._load_keys()
+        old = keys.get(user)
+        valid = [k for k in [old or {}, *_older_keys(old or {})] if k.get("key") and k.get("expiry", 0) > time.time()]
+        keys[user] = {"key": key_hex, "address": acct.address, "expiry": expiry,
+                      "prev": [{f: k[f] for f in ("key", "address", "expiry") if f in k} for k in valid[:MAX_OLD_KEYS]]}
+        self._save_keys(keys)   # before sending: a registration whose answer is lost may still go through
+        try:
+            self._submit(self.wallets[w].private_key, "RegisterSessionKey", {
+                "user": self.addr(w), "key": acct.address, "expiry": expiry, "feeAddress": FEE_ADDRESS,
+                "nonce": self.nonces.next(), "deadline": self._deadline(REGISTER_DEADLINE_S)})
+        except IntentRejected as e:
+            keys = self._load_keys()
+            if old:
+                keys[user] = old
+            else:
+                keys.pop(user, None)
+            self._save_keys(keys)
+            log.error("Wallet %s: enregistrement de session key refusé: %s", w, e)
+            return False
+        except Exception as e:
+            log.error("Wallet %s: enregistrement de session key sans réponse claire (%s): clé gardée au cas où", w, e)
+            return False
+        log.info("Wallet %s: session key %s enregistrée (valide %d jours)", w, acct.address,
+                 SESSION_KEY_LIFETIME_S // 86400)
+        return True
+
+    def register_keys(self) -> bool:
+        return all([self._register(w) for w in self.wallets])
+
+    def keys_ready(self, margin_s: float = 3600) -> bool:
+        return not self.use_session_key or all(self.key_expiry(w) - time.time() > margin_s for w in self.wallets)
+
+    def maintain_keys(self) -> None:
+        """Renews keys close to expiry. The bot calls it only between cycles, never with a pair open."""
+        if not self.use_session_key:
+            return
+        for w in self.wallets:
+            if self.key_expiry(w) - time.time() < SESSION_KEY_RENEW_S:
+                self._register(w, min_interval_s=600)

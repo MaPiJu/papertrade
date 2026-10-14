@@ -28,7 +28,7 @@ class Params:
     margin_fraction: float = 1.0       # share of the smaller balance used as margin per leg
     max_margin_usd: float = 0.0        # 0 = no cap
     rebalance_threshold: float = 0.10  # rebalance when |A-B| / (A+B) exceeds this
-    min_rebalance_usd: float = 5.0
+    min_rebalance_usd: float = 11.0    # never below MIN_CORE_TRANSFER_USD
     stake_threshold: float = 1000.0    # stake as soon as a wallet holds this much unstaked PAPER
     max_cost_per_1000: float = 7.0     # USD per 1,000 PAPER above which farming stops
     cost_window: int = 1               # cycles averaged for the cost cap (1 = rusk0f's per-cycle rule)
@@ -93,12 +93,15 @@ def plan_open(bal_a: float, bal_b: float, min_margin: float, min_notional: float
     return OpenPlan(margin=margin, leverage=leverage, close_move=move)
 
 
-MIN_FORCED_TRANSFER_USD = 1.0
+# PaperTrade withdrawals and deposits through HyperCore need 10 USDC, and a wallet's first
+# withdrawal also pays 1 USDC to activate its HyperCore account (seen on the website 14/10/2026).
+MIN_DEPOSIT_USD = 10.0
+MIN_CORE_TRANSFER_USD = 11.0
 
 
 def plan_rebalance(bal_a: float, bal_b: float, p: Params, mins: tuple[float, float] = (0.0, 0.0)) -> Transfer | None:
     """Half the gap, when the gap is large, or when it alone prevents opening a pair
-    that equal balances would allow (a transfer under $1 is not worth its fees)."""
+    that equal balances would allow; never under the 11 USDC a transfer needs."""
     total = bal_a + bal_b
     diff = abs(bal_a - bal_b)
     amount = floor_cents(diff / 2)
@@ -106,10 +109,9 @@ def plan_rebalance(bal_a: float, bal_b: float, p: Params, mins: tuple[float, flo
         return None
     blocking = (mins[1] > 0 and isinstance(plan_open(bal_a, bal_b, *mins, p), Skip)
                 and not isinstance(plan_open(total / 2, total / 2, *mins, p), Skip))
-    if blocking:
-        if amount < MIN_FORCED_TRANSFER_USD:
-            return None
-    elif diff / total < p.rebalance_threshold or amount < p.min_rebalance_usd:
+    if amount < max(MIN_CORE_TRANSFER_USD, 0 if blocking else p.min_rebalance_usd):
+        return None
+    if not blocking and diff / total < p.rebalance_threshold:
         return None
     return Transfer("A", "B", amount) if bal_a > bal_b else Transfer("B", "A", amount)
 

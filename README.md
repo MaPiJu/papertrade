@@ -176,7 +176,7 @@ le fausserait. `stake-now` refuse tant qu'un cycle est en cours ; arrêtez d'abo
 | `CLOSE_MOVE_PCT` | 0.70 | mouvement de prix qui déclenche la fermeture des 2 jambes |
 | `LIQ_SAFETY_PCT` | 0.15 | écart minimum gardé avant la liquidation (borne `CLOSE_MOVE_PCT`) |
 | `MARGIN_FRACTION` / `MAX_MARGIN_USD` | 1.0 / 0 | marge par jambe = plus petit solde × fraction (plafonnée) |
-| `REBALANCE_THRESHOLD_PCT` / `MIN_REBALANCE_USD` | 10 / 5 | quand rééquilibrer |
+| `REBALANCE_THRESHOLD_PCT` / `MIN_REBALANCE_USD` | 10 / 11 | quand rééquilibrer (11 minimum : retraits et dépôts de 10 USDC, +1 USDC d'activation HyperCore au premier retrait) |
 | `STAKE_THRESHOLD_PAPER` | 1000 | seuil de staking automatique |
 | `MAX_COST_PER_1000_PAPER` / `COST_WINDOW` | 7 / 1 | arrêt dès qu'un cycle (ou la moyenne de N cycles) dépasse le plafond |
 | `OPEN_DEADLINE_S` | 120 | durée de validité d'un ordre d'ouverture (à monter si le relayer est lent) |

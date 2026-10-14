@@ -25,8 +25,8 @@ from pathlib import Path
 from .constants import SCALE, STAKE_DEADLINE_S, WITHDRAW_DEADLINE_S
 from .papertrade_api import IntentRejected
 from .positions import Position, plausible_price
-from .strategy import (Params, Skip, cost_cap_hit, cost_per_1000, floor_cents, liq_distance, plan_open,
-                       plan_rebalance)
+from .strategy import (MIN_DEPOSIT_USD, Params, Skip, cost_cap_hit, cost_per_1000, floor_cents, liq_distance,
+                       plan_open, plan_rebalance)
 
 log = logging.getLogger("ptbot")
 
@@ -106,8 +106,9 @@ def apply_resume(st: dict, reset_costs: bool = False) -> None:
 
 
 def _arrived(delta: float, amount: float) -> bool:
-    """A transfer counts as arrived net of small fees (and never when nothing came)."""
-    return delta > 0 and delta >= amount - min(1.5, 0.05 * amount)
+    """A transfer counts as arrived net of small fees, including the 1 USDC HyperCore activation
+    of a wallet's first withdrawal (and never when nothing came)."""
+    return delta > 0 and delta >= amount - max(1.05, min(1.5, 0.05 * amount))
 
 
 class Bot:
@@ -758,6 +759,10 @@ class Bot:
         elif r["step"] == "send":
             if r["send_amount"] <= 0:
                 self._finish_rebalance(f"rien à envoyer vers {dst}: vérifiez le spot HyperCore de {src}")
+                return
+            if r["send_amount"] < MIN_DEPOSIT_USD:   # PaperTrade would not credit it
+                self._finish_rebalance(f"{r['send_amount']:.2f}$ arrivés sur le spot HyperCore de {src}, sous le "
+                                       f"minimum de dépôt de {MIN_DEPOSIT_USD:.0f}$: déposez-les à la main")
                 return
             if r["send_attempts"] >= 3:
                 self._finish_rebalance(f"envoi HyperCore {src} -> dépôt {dst} en échec 3 fois: "

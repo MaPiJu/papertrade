@@ -58,9 +58,11 @@ def test_cost_cap_needs_a_full_window():
 
 
 def test_small_gap_is_rebalanced_when_it_alone_blocks_the_min_notional():
-    assert plan_rebalance(98.88, 103.0, x100()) is None
-    t = plan_rebalance(98.88, 103.0, x100(), mins=(10, 10_000))
-    assert (t.src, t.dst, t.amount) == ("B", "A", 2.06)
+    p = x100(rebalance_threshold=0.2)
+    assert plan_rebalance(95, 125, p) is None                          # 13.6% gap: under the threshold
+    t = plan_rebalance(95, 125, p, mins=(10, 10_000))                   # ...but it blocks a 10k pair
+    assert (t.src, t.dst, t.amount) == ("B", "A", 15.0)
+    assert plan_rebalance(98.88, 103.0, p, mins=(10, 10_000)) is None   # 2.06$: under the 11 USDC a transfer needs
 
 
 def test_default_cost_cap_judges_each_cycle():
@@ -76,8 +78,8 @@ def test_a_cycle_that_made_money_costs_nothing():
 
 def test_blocking_rebalance_follows_the_margin_fraction():
     p = x100(margin_fraction=0.5)
-    t = plan_rebalance(210, 190, p, mins=(10, 10_000))
-    assert (t.src, t.dst, t.amount) == ("A", "B", 10.0)
+    t = plan_rebalance(215, 185, p, mins=(10, 10_000))
+    assert (t.src, t.dst, t.amount) == ("A", "B", 15.0)
     assert plan_rebalance(100.40, 99.70, x100(), mins=(10, 10_000)) is None   # 0.35$: not worth a transfer
 
 
@@ -90,3 +92,9 @@ def test_default_sizing_is_11k_notional_at_250x():
     assert (plan.margin, plan.leverage) == (42.5, 250)
     assert isinstance(plan_open(39.9, 39.9, 10, 10_000, p), Skip)      # 9,975$ < 10,000$ at x250
     assert plan_open(100, 100, 10, 10_000, Params(leverage=200, max_leverage=250)).margin == 55
+
+
+def test_rebalance_never_under_the_core_transfer_minimum():
+    from ptbot.strategy import MIN_CORE_TRANSFER_USD
+    assert plan_rebalance(40, 60, x100(min_rebalance_usd=1)) is None    # 10$ < 11 USDC, whatever the setting
+    assert plan_rebalance(38, 62, x100()).amount == 12.0 >= MIN_CORE_TRANSFER_USD

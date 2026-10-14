@@ -8,7 +8,7 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 from .constants import EXCHANGE_BASE, HL_API, HYPEREVM_RPC, INSTRUMENTS
-from .strategy import Params
+from .strategy import MIN_CORE_TRANSFER_USD, Params
 from .venue import Wallet
 
 
@@ -59,7 +59,7 @@ def load_settings(env_file: str = ".env", need_keys: bool = True) -> Settings:
         margin_fraction=_f("MARGIN_FRACTION", 1.0),
         max_margin_usd=_f("MAX_MARGIN_USD", 0),
         rebalance_threshold=_pct("REBALANCE_THRESHOLD_PCT", 10),
-        min_rebalance_usd=_f("MIN_REBALANCE_USD", 5),
+        min_rebalance_usd=max(MIN_CORE_TRANSFER_USD, _f("MIN_REBALANCE_USD", MIN_CORE_TRANSFER_USD)),
         stake_threshold=_f("STAKE_THRESHOLD_PAPER", 1000),
         max_cost_per_1000=_f("MAX_COST_PER_1000_PAPER", 7),
         cost_window=int(_f("COST_WINDOW", 1)),

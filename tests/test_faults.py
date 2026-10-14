@@ -532,3 +532,10 @@ def test_a_misread_margin_unit_does_not_make_the_bot_close_its_own_leg(tmp_path)
     run_for(bot, 30)
     assert store.data["phase"] == "open"
     assert all(len(a.positions) == 1 for a in venue.accounts.values())
+
+
+def test_first_withdrawal_activation_fee_still_counts_as_arrived():
+    from ptbot.bot import _arrived
+    assert _arrived(10.32, 11.32)            # 1 USDC HyperCore activation on a wallet's first withdrawal
+    assert not _arrived(9.0, 11.32)
+    assert not _arrived(0, 11.32)

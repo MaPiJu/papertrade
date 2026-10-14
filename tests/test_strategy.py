@@ -94,6 +94,11 @@ def test_default_sizing_is_11k_notional_at_250x():
     assert plan_open(100, 100, 10, 10_000, Params(leverage=200, max_leverage=250)).margin == 55
 
 
+def test_rebalance_moves_whole_usdc():
+    t = plan_rebalance(43.84, 66.45, x100())
+    assert (t.src, t.dst, t.amount) == ("B", "A", 11.0)
+
+
 def test_rebalance_never_under_the_core_transfer_minimum():
     from ptbot.strategy import MIN_CORE_TRANSFER_USD
     assert plan_rebalance(40, 60, x100(min_rebalance_usd=1)) is None    # 10$ < 11 USDC, whatever the setting

@@ -104,7 +104,7 @@ def plan_rebalance(bal_a: float, bal_b: float, p: Params, mins: tuple[float, flo
     that equal balances would allow; never under the 11 USDC a transfer needs."""
     total = bal_a + bal_b
     diff = abs(bal_a - bal_b)
-    amount = floor_cents(diff / 2)
+    amount = float(math.floor(diff / 2 + 1e-9))   # whole USDC, as the website withdraws
     if total <= 0 or amount <= 0:
         return None
     blocking = (mins[1] > 0 and isinstance(plan_open(bal_a, bal_b, *mins, p), Skip)

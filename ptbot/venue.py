@@ -134,8 +134,9 @@ class LiveVenue:
     def _deadline(self, seconds: int = 3600) -> int:
         return int(time.time()) + seconds
 
-    def _submit(self, signer_key: str, intent_type: str, fields: dict) -> str:
+    def _submit(self, signer_key: str, intent_type: str, fields: dict, extra: dict | None = None) -> str:
         body = build_intent(signer_key, intent_type, fields, self.domains)
+        body.update(extra or {})
         resp = self.api.submit(body)
         return str(resp.get("intentId", ""))
 
@@ -190,9 +191,12 @@ class LiveVenue:
             "user": self.addr(w), "nonce": self.nonces.next(), "deadline": self._deadline()})
 
     def withdraw_to_core(self, w: str, amount: float) -> str:
+        """To the wallet's own HyperCore spot account. As on the website: the amount is in USDC
+        units of 10^-6 (not 10^-18 like margins) and the body carries the withdrawal route."""
         return self._submit(self.wallets[w].private_key, "WithdrawToCore", {
-            "user": self.addr(w), "amount": int(round(amount * 100)) * SCALE // 100,
-            "nonce": self.nonces.next(), "deadline": self._deadline(WITHDRAW_DEADLINE_S)})
+            "user": self.addr(w), "amount": int(round(amount * 100)) * 10**4,
+            "nonce": self.nonces.next(), "deadline": self._deadline(WITHDRAW_DEADLINE_S)},
+            extra={"withdrawal": {"route": "hypercore"}})
 
     def core_perp_to_spot(self, w: str, amount: float) -> None:
         self.transfers[w].perp_to_spot(amount)

@@ -155,7 +155,8 @@ def test_stake_and_withdraw_are_signed_by_the_main_wallet(tmp_path):
     stake, wd = api.sent
     assert recover_signer("Stake", stake, DOMAINS) == venue.addr("B")
     assert recover_signer("WithdrawToCore", wd, DOMAINS) == venue.addr("B")
-    assert wd["signed"]["amount"] == str(6543 * SCALE // 100)
+    assert wd["signed"]["amount"] == "65430000"                 # USDC units of 10^-6, as on the website
+    assert wd["withdrawal"] == {"route": "hypercore"} and "withdrawal" not in stake
 
 
 def test_queued_raises_on_network_errors_and_reads_zero_only_when_unsupported(tmp_path):

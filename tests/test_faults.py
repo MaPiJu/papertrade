@@ -161,7 +161,7 @@ def test_exit_uses_each_legs_own_entry(tmp_path):
 
 def test_previously_seen_position_is_never_adopted(tmp_path):
     venue, store, bot = make(tmp_path, [(0, 100_000)])
-    store.data["seen_ids"]["A"] = [99]
+    store.data["known_ids"]["A"] = [99]
     real = venue.positions
 
     def lagging(w):  # while opening, the API still lists an old closed position on A
@@ -178,7 +178,7 @@ def test_ghost_position_pauses_instead_of_blocking_silently(tmp_path):
     real = venue.positions
     venue.positions = lambda w: [Position(7, "BTC", True)] + real(w) if w == "A" else real(w)
     run_for(bot, 300)
-    assert store.data["paused"] and "toujours listées" in store.data["paused"]
+    assert store.data["paused"] and "toujours listée" in store.data["paused"]
     assert venue.max_positions == 0
 
 
@@ -217,7 +217,7 @@ def test_crash_between_open_and_save_resumes_and_closes_the_lone_leg(tmp_path):
     assert len(venue.accounts["A"].positions) == 1
     venue.faults = {}
     bot2 = Bot(venue, Params(), StateStore(tmp_path / "state.json"), Timing())
-    run_for(bot2, 200)
+    run_for(bot2, 330)  # B may have been signed late: the lone A leg is price-watched until B's order expires
     assert venue.max_positions <= 1
     assert bot2.st["totals"]["cycles"] == 1          # the aborted lone leg was closed and booked
 
@@ -257,3 +257,87 @@ def test_unknown_api_payload_raises_instead_of_reading_no_positions():
     assert _list_payload([1]) == [1]
     with pytest.raises(ValueError):
         _list_payload({"ok": True, "result": {}})
+
+
+# --- regressions from the review of the rewrite ---------------------------------
+
+def test_late_fill_after_an_abort_is_closed_and_booked_with_the_cycle(tmp_path):
+    # B's response is lost and it fills 100 s later; meanwhile A alone hits its exit and is closed
+    points = [(0, 100_000), (20, 99_250), (100, 99_250), (110, 100_250)]
+    venue, store, bot = make(tmp_path, points, {("open", "B"): {"lost": True, "delay": 100}}, usdc=150)
+    run_for(bot, 200)
+    assert venue.liquidations == 0
+    assert all(not a.positions for a in venue.accounts.values())
+    assert store.data["totals"]["cycles"] == 1
+
+
+def test_one_empty_read_does_not_hide_a_stray(tmp_path):
+    venue, store, bot = make(tmp_path, [(0, 100_000)], usdc=150)
+    venue.close_noops = 1                      # the first close of the stray is ignored
+    SimVenue.open(venue, "B", "BTC", False, 20.0, 500, 120)   # a stray short already on B
+    bot.step()                                 # idle sees it and tries to close it
+    venue.empty_reads = 2                      # then one read of both wallets comes back empty
+    run_for(bot, 30)
+    assert venue.max_positions <= 1            # no pair opened on top of the stray
+    assert 1 not in venue.accounts["B"].positions   # the stray was closed before the next pair
+
+
+def test_unknown_entry_assumes_the_worst_price_seen(tmp_path):
+    venue, store, bot = make(tmp_path, [(0, 100_000), (30, 100_500)], {("open", "B"): {"delay": 20}})
+    real = venue.positions
+    venue.positions = lambda w: [Position(p.id, p.coin, p.is_long) for p in real(w)]  # no entry prices
+    run_for(bot, 60)
+    legs = store.data["cycle"]["legs"]
+    assert legs["B"]["entry"] == 100_000       # the short is measured from the lowest mid seen, not 100,500
+
+
+def test_gateway_error_on_submit_is_ambiguous_not_a_refusal():
+    from ptbot.papertrade_api import IntentRejected, PaperTradeApi
+
+    class Resp:
+        def __init__(self, code, body):
+            self.status_code, self._body, self.text = code, body, str(body)
+            self.ok = code < 400
+
+        def json(self):
+            if self._body is None:
+                raise ValueError
+            return self._body
+
+    api = PaperTradeApi("http://unused")
+    for code, body, refused in ((504, None, False), (502, {"error": "bad gateway"}, False), (200, None, False),
+                                (400, {"error": "bad signature"}, True), (403, None, True),
+                                (200, {"error": "nonce used"}, True)):
+        api._request = lambda *a, **k: Resp(code, body)
+        with pytest.raises(IntentRejected if refused else RuntimeError) as e:
+            api.submit({"action": "openPosition"})
+        assert isinstance(e.value, IntentRejected) == refused
+
+
+def test_resume_file_clears_pause_and_counters_while_running(tmp_path):
+    venue, store, bot = make(tmp_path, [(0, 100_000)])
+    store.data.update(paused="test", open_failures=3)
+    (tmp_path / "RESUME").write_text("")
+    bot.step()
+    assert not store.data["paused"] and store.data["open_failures"] == 0
+    assert not (tmp_path / "RESUME").exists()
+
+
+def test_old_state_mid_cycle_is_refused_with_a_message(tmp_path):
+    from ptbot.bot import IncompatibleState
+
+    old = {"phase": "open", "cycle": {"legs": {}}, "rebalance": None, "paused": None, "history": [],
+           "totals": {"cycles": 0, "usd_spent": 0.0, "paper_minted": 0.0, "paper_staked": 0.0}}
+    (tmp_path / "state.json").write_text(__import__("json").dumps(old))
+    with pytest.raises(IncompatibleState):
+        Bot(SimVenue(Path([(0, 100_000)])), Params(), StateStore(tmp_path / "state.json"), Timing())
+
+
+def test_ghost_position_in_closing_pauses(tmp_path):
+    venue, store, bot = make(tmp_path, [(0, 100_000), (60, 100_750)])
+    run_for(bot, 61)
+    real = venue.positions
+    ghost = store.data["cycle"]["legs"]["A"]["pos_id"]
+    venue.positions = lambda w: [Position(ghost, "BTC", True)] + real(w) if w == "A" else real(w)
+    run_for(bot, 600)
+    assert store.data["paused"] and "toujours listées" in store.data["paused"]

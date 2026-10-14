@@ -105,7 +105,7 @@ def cmd_status(settings, args) -> None:
     print(f"Phase: {st['phase']}  Pause: {st.get('paused')}")
     t = st["totals"]
     print(f"Cycles: {t['cycles']}  PAPER générés: {t['paper_minted']:,.0f}  coût: {t['usd_spent']:.2f}$  "
-          f"PAPER stakés par le bot: {t['paper_staked']:,.0f}")
+          f"(+{t.get('usd_offcycle', 0):.2f}$ hors cycle)  PAPER stakés par le bot: {t['paper_staked']:,.0f}")
     for c in st["history"][-10:]:
         print(f"  cycle: {c['usd']:.2f}$ -> {c['paper']:,.0f} PAPER")
 
@@ -120,7 +120,7 @@ def cmd_plan(settings, args) -> None:
     bal = {w: venue.usdc(w) for w in ("A", "B")}
     mins = venue.minimums()
     print(f"Soldes PaperTrade: A={bal['A']:.2f}$  B={bal['B']:.2f}$   minimums: marge {mins[0]:.2f}$, notionnel {mins[1]:,.0f}$")
-    t = plan_rebalance(bal["A"], bal["B"], p, mins[1])
+    t = plan_rebalance(bal["A"], bal["B"], p, mins)
     if t:
         print(f"-> d'abord rééquilibrer: {t.amount:.2f}$ de {t.src} vers {t.dst}")
         half = (bal["A"] + bal["B"]) / 2
@@ -158,11 +158,17 @@ def cmd_run(settings, args) -> None:
         print("Le bot va trader de vrais fonds sur PaperTrade avec les deux wallets du fichier .env.")
         if input("Tapez OUI pour continuer: ").strip().upper() != "OUI":
             return
+    from .bot import IncompatibleState
+
     venue = build_live(settings)
     store = StateStore(settings.state_dir / "state.json")
     log.info("Démarrage: A=%s (long), B=%s (short), %s x%d", venue.addr("A"), venue.addr("B"),
              settings.params.coin, settings.params.leverage)
-    Bot(venue, settings.params, store).run(stop_file=Path("STOP"))
+    try:
+        bot = Bot(venue, settings.params, store)
+    except IncompatibleState as e:
+        raise SystemExit(str(e))
+    bot.run(stop_file=Path("STOP"))
 
 
 def cmd_sim(settings, args) -> None:
@@ -210,15 +216,14 @@ def cmd_close_all(settings, args) -> None:
 
 
 def cmd_resume(settings, args) -> None:
-    from .bot import StateStore
+    from .bot import StateStore, apply_resume
 
+    # A running bot rewrites state.json every step: it picks the request up from this file instead.
+    (settings.state_dir / "RESUME").write_text("reset-costs" if args.reset_costs else "")
     store = StateStore(settings.state_dir / "state.json")
-    store.data["paused"] = None
-    store.data["next_try"] = 0
-    if args.reset_costs:
-        store.data["history"] = []
+    apply_resume(store.data, args.reset_costs)
     store.save()
-    print("Pause levée.")
+    print("Pause levée (prise en compte au prochain tour si le bot tourne).")
 
 
 def main(argv=None) -> None:

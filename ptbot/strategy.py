@@ -86,15 +86,23 @@ def plan_open(bal_a: float, bal_b: float, min_margin: float, min_notional: float
     return OpenPlan(margin=margin, leverage=leverage, close_move=move)
 
 
-def plan_rebalance(bal_a: float, bal_b: float, p: Params, min_notional: float = 0.0) -> Transfer | None:
+MIN_FORCED_TRANSFER_USD = 1.0
+
+
+def plan_rebalance(bal_a: float, bal_b: float, p: Params, mins: tuple[float, float] = (0.0, 0.0)) -> Transfer | None:
+    """Half the gap, when the gap is large, or when it alone prevents opening a pair
+    that equal balances would allow (a transfer under $1 is not worth its fees)."""
     total = bal_a + bal_b
     diff = abs(bal_a - bal_b)
-    if total <= 0:
-        return None
     amount = floor_cents(diff / 2)
-    # Even a small gap must be closed when it alone keeps the smaller wallet under the minimum notional.
-    blocking = min(bal_a, bal_b) * p.max_leverage < min_notional <= total / 2 * p.max_leverage
-    if amount <= 0 or (not blocking and (diff / total < p.rebalance_threshold or amount < p.min_rebalance_usd)):
+    if total <= 0 or amount <= 0:
+        return None
+    blocking = (mins[1] > 0 and isinstance(plan_open(bal_a, bal_b, *mins, p), Skip)
+                and not isinstance(plan_open(total / 2, total / 2, *mins, p), Skip))
+    if blocking:
+        if amount < MIN_FORCED_TRANSFER_USD:
+            return None
+    elif diff / total < p.rebalance_threshold or amount < p.min_rebalance_usd:
         return None
     return Transfer("A", "B", amount) if bal_a > bal_b else Transfer("B", "A", amount)
 
@@ -108,6 +116,8 @@ def should_exit(entry: float, mid: float, close_move: float) -> bool:
 
 
 def cost_per_1000(usd_spent: float, paper_minted: float) -> float:
+    if usd_spent <= 0:
+        return 0.0  # nothing spent (a cycle that broke even or made money)
     return math.inf if paper_minted <= 0 else usd_spent / paper_minted * 1000
 
 

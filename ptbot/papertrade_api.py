@@ -105,11 +105,18 @@ class PaperTradeApi:
 
     # --- writes ------------------------------------------------------------
     def submit(self, body: dict) -> dict:
+        """IntentRejected only when the relayer clearly refused (4xx or an error
+        payload). A 5xx, a gateway error or an unreadable body may come after the
+        intent was queued: that is raised as a plain error ("maybe executed")."""
         r = self._request("POST", "/intents", json=body)
         try:
             data = r.json()
         except ValueError:
-            data = {"error": r.text[:300]}
-        if not r.ok or (isinstance(data, dict) and (data.get("error") or data.get("ok") is False)):
-            raise IntentRejected(f"{body['action']} refusé (HTTP {r.status_code}): {data}")
+            data = None
+        if 400 <= r.status_code < 500:
+            raise IntentRejected(f"{body['action']} refusé (HTTP {r.status_code}): {data or r.text[:300]}")
+        if not r.ok or not isinstance(data, dict):
+            raise RuntimeError(f"{body['action']}: réponse ambiguë (HTTP {r.status_code}), l'ordre a peut-être été pris")
+        if data.get("error") or data.get("ok") is False:
+            raise IntentRejected(f"{body['action']} refusé: {data}")
         return data

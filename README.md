@@ -11,7 +11,8 @@ méthode décrite par [@rusk0f](https://x.com/rusk0f/status/2109921167830389061)
 - **rééquilibrage des USDC** : après chaque cycle, un wallet a gagné et l'autre perdu. Le bot retire la moitié de
   l'écart du wallet riche vers HyperCore, puis l'envoie à l'adresse de dépôt PaperTrade de l'autre wallet ;
 - **arrêt automatique** : dès qu'un cycle a coûté plus de 7 $ pour 1 000 PAPER, le bot arrête d'ouvrir des paires
-  (l'émission baisse avec le temps), mais continue de staker.
+  (l'émission baisse avec le temps), mais continue de staker. Le coût cumulé de tous les cycles (avortés compris)
+  est aussi surveillé.
 
 ```
 idle ──► (rééquilibrage A⇄B si besoin) ──► ouverture long A + short B ──► surveillance du prix BBO Hyperliquid
@@ -43,8 +44,8 @@ idle ──► (rééquilibrage A⇄B si besoin) ──► ouverture long A + sh
 - **Clés privées.** Le bot a besoin des clés des deux wallets : le staking et les retraits sont signés par le
   wallet principal. Utilisez deux wallets dédiés, ne mettez que ce que vous acceptez de perdre, gardez `.env` et
   `data/session_keys.json` pour vous.
-- **Wallets dédiés.** Entre deux cycles, le bot **ferme toute position qu'il ne gère pas** sur A et B (un ordre
-  exécuté en retard, une réponse perdue… ou un trade fait à la main). Ne tradez pas à la main sur ces wallets.
+- **Wallets dédiés.** Le bot **ferme toute position qu'il ne gère pas** sur A et B (un ordre exécuté en retard,
+  une réponse perdue… ou un trade fait à la main). Ne tradez pas à la main sur ces wallets.
 
 ## Installation
 
@@ -95,16 +96,22 @@ cours puis s'arrête ; un second `Ctrl+C` force l'arrêt. Une paire ouverte **re
 bot reprend le cycle en cours (`data/state.json`). Pour tout couper : `close-all`.
 
 **Ce qui est géré en cas de problème** :
-- réponse perdue ou erreur réseau sur un ordre : l'ordre est considéré comme « peut-être exécuté ». Le bot le
-  surveille jusqu'à son expiration (2 min) et n'ouvre jamais une nouvelle paire avant ;
+- réponse perdue, erreur réseau ou erreur 5xx sur un ordre : l'ordre est considéré comme « peut-être exécuté ».
+  Le bot le surveille jusqu'à son expiration (2 min), ferme et comptabilise une exécution tardive avec son cycle,
+  et n'ouvre jamais une nouvelle paire avant ;
 - une jambe ouverte seule : sa perte est surveillée et elle est fermée dès qu'elle atteint la distance de sortie,
   ou à l'expiration de l'autre ordre ;
 - l'état est sauvegardé **avant** chaque ordre et chaque transfert : un crash ou un redémarrage reprend où il en
   était, sans rouvrir de paire ni retirer deux fois ;
-- une lecture d'API vide ou en retard ne ferme pas la paire (3 lectures manquées d'affilée sont nécessaires) ;
+- une lecture d'API vide ou en retard ne ferme pas la paire et ne cache pas une position à fermer (3 lectures
+  manquées d'affilée sont nécessaires) ; si le prix d'entrée est illisible, le bot retient le pire prix vu ;
 - chaque jambe sort sur son propre prix d'entrée, même si les deux ont été exécutées à des prix différents ;
 - les transferts lents (retrait vers HyperCore, crédit du dépôt) sont attendus jusqu'à 2 h, avec relance automatique
-  si un retrait a expiré sans être exécuté.
+  si un retrait a expiré sans être exécuté ou si un envoi n'est jamais parti.
+
+`python -m ptbot resume` fonctionne aussi pendant que le bot tourne (il le prend en compte au tour suivant). Un
+`data/state.json` d'une version précédente du bot, laissé en plein cycle, est refusé au démarrage avec la marche à
+suivre.
 
 **Pauses** : le bot se met en pause (et continue de staker) quand le plafond de coût est atteint, quand un
 rééquilibrage reste bloqué 2 h, après 3 paires ratées d'affilée, si une position reste listée après 8 tentatives de

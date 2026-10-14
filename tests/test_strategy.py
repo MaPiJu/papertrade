@@ -57,10 +57,23 @@ def test_cost_cap_needs_a_full_window():
 
 def test_small_gap_is_rebalanced_when_it_alone_blocks_the_min_notional():
     assert plan_rebalance(98.88, 103.0, Params()) is None
-    t = plan_rebalance(98.88, 103.0, Params(), min_notional=10_000)
+    t = plan_rebalance(98.88, 103.0, Params(), mins=(10, 10_000))
     assert (t.src, t.dst, t.amount) == ("B", "A", 2.06)
 
 
 def test_default_cost_cap_judges_each_cycle():
     hit, avg = cost_cap_hit([{"usd": 9, "paper": 1000}], Params())
     assert hit and avg == 9
+
+
+def test_a_cycle_that_made_money_costs_nothing():
+    from ptbot.strategy import cost_per_1000
+    assert cost_per_1000(-5.0, 0) == 0.0
+    assert cost_per_1000(5.0, 0) == math.inf
+
+
+def test_blocking_rebalance_follows_the_margin_fraction():
+    p = Params(margin_fraction=0.5)
+    t = plan_rebalance(210, 190, p, mins=(10, 10_000))
+    assert (t.src, t.dst, t.amount) == ("A", "B", 10.0)
+    assert plan_rebalance(100.40, 99.70, Params(), mins=(10, 10_000)) is None   # 0.35$: not worth a transfer

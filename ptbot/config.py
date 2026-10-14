@@ -48,13 +48,14 @@ def load_settings(env_file: str = ".env", need_keys: bool = True) -> Settings:
     coin = os.getenv("COIN", "BTC").upper()
     if coin not in INSTRUMENTS:
         raise SystemExit(f"COIN doit être l'un de {list(INSTRUMENTS)}")
-    leverage = int(_f("LEVERAGE", 100))
+    leverage = int(_f("LEVERAGE", 250))
     params = Params(
         coin=coin,
         leverage=leverage,
         max_leverage=max(leverage, int(_f("MAX_LEVERAGE", leverage))),
         close_move=_pct("CLOSE_MOVE_PCT", 0.70),
         liq_safety=_pct("LIQ_SAFETY_PCT", 0.15),
+        target_notional=_f("TARGET_NOTIONAL_USD", 11_000),
         margin_fraction=_f("MARGIN_FRACTION", 1.0),
         max_margin_usd=_f("MAX_MARGIN_USD", 0),
         rebalance_threshold=_pct("REBALANCE_THRESHOLD_PCT", 10),

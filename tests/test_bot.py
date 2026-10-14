@@ -3,7 +3,8 @@ from ptbot.bot import Bot, StateStore, Timing
 from ptbot.constants import SCALE
 from ptbot.papertrade_api import IntentRejected
 from ptbot.sim import SimVenue
-from ptbot.strategy import Params
+
+from . import x100
 
 T0 = 1_800_000_000.0
 
@@ -25,7 +26,7 @@ class Path:
 def make(tmp_path, points, usdc=100.0, emission=50.0, params=None, venue_cls=SimVenue):
     venue = venue_cls(Path(points), start_usdc=usdc, emission=emission)
     store = StateStore(tmp_path / "state.json")
-    return venue, store, Bot(venue, params or Params(), store, Timing())
+    return venue, store, Bot(venue, params or x100(), store, Timing())
 
 
 def run_for(bot, seconds):
@@ -75,7 +76,7 @@ def test_price_gap_through_liquidation_is_booked(tmp_path):
 
 
 def test_cost_cap_pauses_farming_but_keeps_staking(tmp_path):
-    params = Params(max_cost_per_1000=7, cost_window=2)
+    params = x100(max_cost_per_1000=7, cost_window=2)
     points = [(0, 100_000)]
     px = 100_000
     for i in range(1, 12):                  # alternating 0.75% moves
@@ -126,7 +127,7 @@ def test_restart_resumes_the_open_pair(tmp_path):
     run_for(bot, 300)
     assert store.data["phase"] == "open"
     store2 = StateStore(tmp_path / "state.json")      # reload from disk, new bot instance
-    bot2 = Bot(venue, Params(), store2, Timing())
+    bot2 = Bot(venue, x100(), store2, Timing())
     run_for(bot2, 700)
     assert store2.data["totals"]["cycles"] == 1
     assert sum(len(a.positions) for a in venue.accounts.values()) == 2   # next pair, not a stacked one

@@ -1,9 +1,8 @@
-"""Rebuilds a wallet's open positions from the PaperTrade trade history.
+"""A wallet's positions from the PaperTrade read API.
 
-The read API is undocumented, so the field names below are a tolerant guess
-covering the usual spellings. `python -m ptbot probe` dumps the raw responses:
-if open positions come out empty while the site shows some, adjust the key
-lists here from that output.
+Open positions come from the live account stream (`live_positions`), as on the website. The
+trade history (`open_positions`) only lists closed positions (kind "PositionClosed"); it is
+kept for diagnostics. `python -m ptbot probe` dumps the raw responses.
 """
 from __future__ import annotations
 
@@ -20,7 +19,7 @@ SIDE_BOOL_KEYS = ("isLong", "long")
 SIDE_STR_KEYS = ("side", "direction", "positionSide")
 MARGIN_KEYS = ("margin", "marginRaw", "size", "sizeRaw", "collateral")
 LEVERAGE_KEYS = ("leverage", "lev")
-ENTRY_KEYS = ("entryPrice", "entryPx", "openPrice", "entry")
+ENTRY_KEYS = ("entryPrice", "entryPriceRaw", "entryPx", "openPrice", "entry")
 
 ID_TO_COIN = {v: k for k, v in INSTRUMENTS.items()}
 
@@ -149,6 +148,43 @@ def open_positions(payload: Any) -> list[Position]:
         raise ValueError(f"format des événements non reconnu ({len(records)} événements, {with_id} avec un id de "
                          f"position, {known_kind} classés): lancez `python -m ptbot probe` et adaptez positions.py")
     return [p for pid, p in opened.items() if pid not in closed]
+
+
+def _flag(v: Any) -> bool | None:
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, (int, float)):
+        return v != 0
+    if isinstance(v, str) and v.lower() in ("true", "false", "1", "0"):
+        return v.lower() in ("true", "1")
+    return None
+
+
+def live_positions(snapshot: Any) -> list[Position]:
+    """Open positions of a /state/user/live snapshot. Rows are [positionId, instrumentId, isLong,
+    useDebt, entryPriceRaw, marginRaw, leverage, bustPriceRaw, openedAt] (objects also read).
+    Anything unreadable raises: an empty list must mean "no open position"."""
+    rows = snapshot.get("openPositions") if isinstance(snapshot, dict) else None
+    if not isinstance(rows, list):
+        raise ValueError("instantané du compte sans liste openPositions")
+    out = []
+    for row in rows:
+        if isinstance(row, (list, tuple)) and len(row) >= 7:
+            pid, inst, side, _debt, entry, margin, lev = row[:7]
+            is_long = _flag(side)
+        elif isinstance(row, dict):
+            pid, inst, entry = _first(row, ID_KEYS + ("id",)), _first(row, COIN_KEYS), _first(row, ENTRY_KEYS)
+            margin, lev, is_long = _first(row, MARGIN_KEYS), _first(row, LEVERAGE_KEYS), _side(row)
+        else:
+            raise ValueError(f"position illisible dans l'instantané du compte: {row!r}"[:200])
+        try:
+            pid = int(pid, 16) if isinstance(pid, str) and pid.lower().startswith("0x") else int(pid)
+        except (TypeError, ValueError):
+            raise ValueError(f"id de position illisible: {row!r}"[:200]) from None
+        lev = _num(lev)
+        out.append(Position(id=pid, coin=_coin(inst), is_long=is_long, margin=_usd(margin),
+                            leverage=int(lev) if lev else None, entry=_num(entry)))
+    return out
 
 
 def plausible_price(raw: float | None, reference: float, tolerance: float = 0.03) -> float | None:

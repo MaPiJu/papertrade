@@ -55,3 +55,28 @@ def test_plausible_price_finds_the_scale():
     assert plausible_price(100_050, 100_000) == 100_050
     assert plausible_price(5, 100_000) is None
     assert plausible_price(None, 100_000) is None
+
+
+def test_live_snapshot_rows():
+    import pytest
+
+    from ptbot.positions import live_positions
+    snap = {"openPositions": [["673851", 0, True, False, "817665", str(44 * 10**18), 250, "814800", 1792015850000],
+                              {"positionId": "0x10", "instrumentId": 1, "isLong": False, "marginRaw": str(10**19),
+                               "leverage": 100, "entryPriceRaw": "241175"}],
+            "paper": {"balance": "0"}, "funds": {"availableBalance": "0"}}
+    a, b = live_positions(snap)
+    assert (a.id, a.coin, a.is_long, a.margin, a.leverage, a.entry) == (673851, "BTC", True, 44.0, 250, 817665.0)
+    assert (b.id, b.coin, b.is_long, b.margin, b.leverage) == (16, "ETH", False, 10.0, 100)
+    assert live_positions({"openPositions": []}) == []
+    for bad in ({"paper": {}}, {"openPositions": [["x", 0, True, False, "1", "1", 1]]}, {"openPositions": ["?"]}):
+        with pytest.raises(ValueError):          # never read as "no position"
+            live_positions(bad)
+
+
+def test_real_trade_history_records_are_closures():
+    rec = {"timestampMs": 1791981854000, "positionId": "596126", "instrumentId": 0, "symbol": "BTC",
+           "priceScaleRaw": "10", "terminal": False, "retired": False, "isLong": True, "entryPriceRaw": "833785",
+           "marginRaw": "40000000000000000000000", "leverage": 40, "kind": "PositionClosed",
+           "openedAtMs": 1791977163000, "exitPriceRaw": "826875", "paperMintedRaw": "0"}
+    assert open_positions({"items": [rec], "nextCursor": None}) == []

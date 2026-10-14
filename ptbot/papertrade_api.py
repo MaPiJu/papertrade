@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import email.utils
+import json
 import logging
 import time
 
@@ -108,6 +109,39 @@ class PaperTradeApi:
             return bool(self.trading_state().get("tradingPaused"))
         except Exception:
             return False
+
+    def account_live(self, address: str, timeout: float = 8.0) -> dict:
+        """First full snapshot of /state/user/live, the server-sent event stream the website
+        reads: open positions, balances, PAPER. Later events are patches, so the stream is closed
+        as soon as the snapshot is in. The trades history only lists closed positions."""
+        deadline = time.time() + timeout
+        r = self.http.get(self.base + "/state/user/live", params={"wallet": address.lower()}, stream=True,
+                          timeout=(5.0, timeout), headers={"Accept": "text/event-stream"})
+        try:
+            r.raise_for_status()
+            event, data = None, []
+            # chunk_size=1: the default 512 would wait for more bytes than a small snapshot holds
+            for raw in r.iter_lines(chunk_size=1):
+                if time.time() > deadline:
+                    break
+                line = (raw.decode("utf-8", "replace") if isinstance(raw, bytes) else raw or "").rstrip("\r")
+                if not line:
+                    if data and event in (None, "wallet"):
+                        snap = json.loads("\n".join(data))
+                        if (isinstance(snap, dict) and "baseAccountRevision" not in snap
+                                and isinstance(snap.get("openPositions"), list)):
+                            return snap
+                    event, data = None, []
+                elif not line.startswith(":"):
+                    field, _, value = line.partition(":")
+                    value = value[1:] if value.startswith(" ") else value
+                    if field == "event":
+                        event = value
+                    elif field == "data":
+                        data.append(value)
+        finally:
+            r.close()
+        raise RuntimeError(f"flux /state/user/live: pas d'instantané complet du compte en {timeout:.0f} s")
 
     def account_trades(self, address: str, pages: int = 3, timeout: float | None = None, retry: bool = True) -> list:
         """The account's trade events. A newest-first feed only needs its first pages; an

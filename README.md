@@ -27,7 +27,8 @@ idle ──► (rééquilibrage A⇄B si besoin) ──► ouverture long A + sh
 - **API non officielle.** PaperTrade ne publie ni SDK ni ABI. Les endpoints, les types EIP-712 et les adresses
   viennent de la rétro-ingénierie du site par la communauté (10/10/2026). Ils peuvent changer sans prévenir.
   Le bot vérifie ce qu'il peut (domaines EIP-712 on-chain, minimums via `/state/trading`), mais **la lecture des
-  positions ouvertes (`/query/accounts/{adresse}/trades`) n'a jamais pu être testée en conditions réelles** :
+  positions ouvertes (flux `/state/user/live`, celui du site ; l'historique `/trades` ne liste que les positions
+  fermées) n'a pas encore été testée sur vos propres positions** :
   suivez la mise en route ci-dessous, `run` refuse de démarrer sans les mini-positions de test.
 - **Conditions d'utilisation.** En phase 1, PaperTrade réserve le trading au site et à des relayers whitelistés,
   et contourner le site « expose à une exclusion ». Le bot envoie les mêmes intents signés que le site, au même
@@ -87,14 +88,14 @@ pas conformes.
    `(10.0, 10000.0)`, sur les comptes publics `ids N/N` sans `unknown`, `balances() return
    size 32 bytes`, adresses de dépôt API = `.env`. Si `profit queue` est actif, `userQueuedTotal` doit être lisible.
 3. **`python -m ptbot probe`**, puis ouvrez `data/probe/probe.json` : soldes égaux à
-   ceux du site, `usdc_queued` est un nombre, `trades_order`, `open_positions_parsed` vide si vous n'avez rien
+   ceux du site, `usdc_queued` est un nombre, `open_positions_live` vide (`[]`) si vous n'avez rien
    d'ouvert.
 4. **Position manuelle sur le site** (bot arrêté, avant d'enregistrer la clé du bot) : sur A, la plus petite
    position possible : 10 $ en x100 si `probe` affiche un minimum de 1 000 $ (`minimums_usd`), en x1000
-   s'il affiche 10 000 $. Pendant qu'elle est ouverte, relancez `probe` : `open_positions_parsed` doit la
+   s'il affiche 10 000 $. Pendant qu'elle est ouverte, relancez `probe` : `open_positions_live` doit la
    contenir (bon id, BTC, sens, prix d'entrée) et `usdc_papertrade` doit avoir baissé d'environ 10 $. Fermez-la (ou
    laissez-la liquider) et relancez `probe` : elle doit avoir disparu. **Sinon, n'allez pas plus loin** et
-   envoyez-moi `trades_raw_first_page` pour adapter `ptbot/positions.py`.
+   envoyez-moi `account_live_raw` (dans `data/probe/probe.json`) pour adapter `ptbot/positions.py`.
 5. **Aller-retour manuel de 5 à 10 $** : retirez de A vers HyperCore sur le site (notez s'il faut une deuxième
    étape, les frais, spot ou perp, la durée), puis envoyez-les vers l'adresse de dépôt de B. Si le crédit prend plus
    d'une heure, le bot se mettra en pause pendant ses rééquilibrages.

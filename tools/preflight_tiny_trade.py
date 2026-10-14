@@ -118,20 +118,17 @@ def run(venue, w, really, log, state_file=None):
     if not pos:
         from ptbot.positions import ID_KEYS, _kind, _records
         free_now = venue.usdc(w)
-        seen = {}
-        for r in _records(raw1):
-            pid = next((r[k] for k in ID_KEYS if r.get(k) not in (None, "")), None)
-            if pid is not None:
-                seen.setdefault(str(pid), set()).add(_kind(r))
-        both = [pid for pid, kinds in seen.items() if {"open", "closed"} <= kinds]
-        if both and free0 - free_now > 0.5:
-            check(True, f"position {both[0]} opened AND closed/liquidated before the first read: open and "
-                        f"liquidation events both understood (free {free0:.2f} -> {free_now:.2f}$). Re-run once to also "
-                        "test a normal close.")
+        # The history only lists closed positions: one opened after the submit is this trade.
+        closed_since = [str(next(r[k] for k in ID_KEYS if r.get(k) not in (None, ""))) for r in _records(raw1)
+                        if _kind(r) == "closed" and any(r.get(k) not in (None, "") for k in ID_KEYS)
+                        and float(r.get("openedAtMs") or 0) >= (t_submit - 30) * 1000]
+        if closed_since and free0 - free_now > 0.5:
+            check(True, f"position {closed_since[0]} opened AND closed/liquidated before the first read "
+                        f"(free {free0:.2f} -> {free_now:.2f}$). Re-run once to also test a normal close.")
             return out, verdict
         check(False, f"position visible through the parser within 150 s (free {free0:.2f} -> {free_now:.2f}$)")
         log("If the free balance dropped, the position EXISTS but the parser cannot see it: close it on the website now, "
-            "and send raw_first to fix positions.py. Do NOT run the bot.")
+            "and send account_live_raw from `python -m ptbot probe` to fix positions.py. Do NOT run the bot.")
         return out, verdict
     check(True, f"position visible after {t_vis - t_submit:.0f}s (keep CLOSE_MOVE_PCT margin for this latency)")
     check(pos.coin in (None, "BTC") and pos.is_long in (None, is_long), f"coin/side parsed ({pos.coin}, long={pos.is_long})")

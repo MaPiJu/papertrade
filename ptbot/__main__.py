@@ -53,7 +53,7 @@ def cmd_probe(settings, args) -> None:
     from .constants import EXCHANGE_CONTRACT, PAPER_STAKING
     from .hyperliquid import HyperliquidInfo
     from .papertrade_api import PaperTradeApi
-    from .positions import open_positions
+    from .positions import live_positions
 
     api, evm, hl = PaperTradeApi(settings.api_url), HyperEvm(settings.rpc_url), HyperliquidInfo(settings.hl_url)
     out_dir = settings.state_dir / "probe"
@@ -73,6 +73,7 @@ def cmd_probe(settings, args) -> None:
     }
     for label, w in settings.wallets.items():
         trades = _try(api.account_trades, w.address)
+        live = _try(api.account_live, w.address)
         report["wallets"][label] = {
             "address": w.address,
             "balances_return_bytes": _try(evm.balances_return_size, w.address),
@@ -85,8 +86,11 @@ def cmd_probe(settings, args) -> None:
             "usdc_hypercore_perp": _try(hl.perp_withdrawable, w.address),
             "deposit_address_env": w.deposit_address,
             "deposit_address_api": _try(api.deposit_address, w.address),
-            "open_positions_parsed": (_try(lambda t: [p.__dict__ for p in open_positions(t)], trades)
-                                      if isinstance(trades, list) else trades),
+            "open_positions_live": (_try(lambda x: [p.__dict__ for p in live_positions(x)], live)
+                                    if isinstance(live, dict) else live),
+            "closed_in_history": (_try(lambda t: len({r.get("positionId") for r in t if isinstance(r, dict)}), trades)
+                                  if isinstance(trades, list) else trades),
+            "account_live_raw": live,
             "trades_raw_first_page": trades[:40] if isinstance(trades, list) else None,
             "funding_raw": _try(api.get, f"/query/accounts/{w.address.lower()}/funding"),
         }
@@ -98,7 +102,7 @@ def cmd_probe(settings, args) -> None:
         print(f"\nWallet {label} {wr['address']}")
         for k in ("balances_return_bytes", "trades_order", "trades_count", "usdc_papertrade", "usdc_queued",
                   "paper_unstaked", "usdc_hypercore_spot", "usdc_hypercore_perp", "deposit_address_env",
-                  "deposit_address_api", "open_positions_parsed"):
+                  "deposit_address_api", "closed_in_history", "open_positions_live"):
             print(f"  {k:24} {wr[k]}")
     print(f"\nRéponses brutes complètes: {path}")
     for label, wr in report["wallets"].items():

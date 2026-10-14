@@ -19,7 +19,7 @@ from .constants import (FEE_ADDRESS, INSTRUMENTS, REGISTER_DEADLINE_S, SCALE, SE
                         SESSION_KEY_RENEW_S, STAKE_DEADLINE_S, WITHDRAW_DEADLINE_S)
 from .hyperliquid import HyperliquidInfo, HyperliquidTransfers
 from .papertrade_api import IntentRejected, PaperTradeApi
-from .positions import Position, open_positions
+from .positions import Position, live_positions
 from .signing import NonceSource, build_intent
 
 log = logging.getLogger(__name__)
@@ -108,7 +108,7 @@ class LiveVenue:
     def positions(self, w: str) -> list[Position]:
         # Short timeout and no retry: the bot polls again in a few seconds, and a slow read
         # must not hold up the price checks that protect an open pair.
-        return open_positions(self.api.account_trades(self.addr(w), timeout=5.0, retry=False))
+        return live_positions(self.api.account_live(self.addr(w), timeout=5.0))
 
     def mid(self, coin: str) -> float:
         return self.hl.bbo_mid(coin)

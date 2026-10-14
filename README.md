@@ -3,9 +3,11 @@
 Bot qui farme du $PAPER sur [PaperTrade](https://papertrade.xyz) avec deux wallets, en reprenant la
 méthode décrite par [@rusk0f](https://x.com/rusk0f/status/2109921167830389061) :
 
-- **delta neutral sur 2 comptes** : le wallet A ouvre un long, le wallet B un short, même coin, même marge, levier x100 ;
-- **jamais de liquidation** : dès que le prix a bougé de `CLOSE_MOVE_PCT` (0,70 % par défaut), le bot ferme
-  **les deux jambes**, bien avant le prix de liquidation (0,95 % en x100). La jambe perdante réalise sa perte et
+- **delta neutral sur 2 comptes** : le wallet A ouvre un long, le wallet B un short, même coin, même marge, levier x250,
+  marge calculée pour une position de 11 000 $ (44 $ par jambe) ;
+- **jamais de liquidation** : dès que le prix a bougé de `CLOSE_MOVE_PCT` (0,70 %), ramené à 0,15 % avant la
+  liquidation quand celle-ci est plus proche (en x250 : liquidation à 0,35 %, fermeture à 0,20 %), le bot ferme
+  **les deux jambes**. La jambe perdante réalise sa perte et
   mint du PAPER, la jambe gagnante récupère le mouvement moins le haircut de PaperTrade ;
 - **staking automatique** : dès qu'un wallet détient 1 000 PAPER non stakés, le bot les stake, sans attendre de « go » ;
 - **rééquilibrage des USDC** : après chaque cycle, un wallet a gagné et l'autre perdu. Le bot retire la moitié de
@@ -16,7 +18,7 @@ méthode décrite par [@rusk0f](https://x.com/rusk0f/status/2109921167830389061)
 
 ```
 idle ──► (rééquilibrage A⇄B si besoin) ──► ouverture long A + short B ──► surveillance du prix BBO Hyperliquid
-  ▲                                                                              │ |mouvement| ≥ 0,70 %
+  ▲                                                                              │ |mouvement| ≥ 0,20 %
   └── stake du PAPER ◄── bilan du cycle (coût $, PAPER mintés) ◄── fermeture des 2 jambes
 ```
 
@@ -30,18 +32,18 @@ idle ──► (rééquilibrage A⇄B si besoin) ──► ouverture long A + sh
 - **Conditions d'utilisation.** En phase 1, PaperTrade réserve le trading au site et à des relayers whitelistés,
   et contourner le site « expose à une exclusion ». Le bot envoie les mêmes intents signés que le site, au même
   relayer, en s'identifiant honnêtement, mais c'est de l'automatisation : c'est votre risque.
-- **Capital et notionnel minimum.** Une position doit faire au moins 10 000 $ de notionnel. Avec 100 $ par wallet
-  en x100, vous êtes **pile au minimum** : après le premier cycle (~9 $ de coût en simulation), les soldes
-  repassent sous 100 $ et le bot ne peut plus ouvrir en x100. Il l'affiche et attend. Pour enchaîner les cycles,
-  il faut soit plus d'USDC (150 $/wallet ≈ 2 à 9 cycles selon le haircut réel, 250 $/wallet environ le double), soit
-  autoriser le levier à monter (`MAX_LEVERAGE=150` ou 200), ce qui rapproche la liquidation. Dans tous les cas,
-  ~100 $ par wallet restent immobilisés comme marge minimale : seul l'excédent est « brûlé » pour minter. Et si la
-  file d'attente des profits de PaperTrade est active, le gain de la jambe gagnante n'est pas disponible tout de
-  suite : à 150 $/wallet, un seul cycle passe avant que les soldes retombent sous le minimum.
+- **Capital et notionnel minimum.** Une position doit faire au moins 10 000 $ de notionnel. Par défaut le bot vise
+  11 000 $ en x250, soit 44 $ de marge par jambe ; quand les soldes baissent il ouvre plus petit, jusqu'au minimum
+  (40 $ en x250). Avec 100 $ par wallet, ~120 $ sur 200 $ peuvent donc être « brûlés » pour minter, ~80 $ restent.
+  En simulation (haircut optimiste, émission 50 PAPER/$) : 29 cycles, ~32 000 PAPER, ~122 $ dépensés (3,80 $/1 000).
+  Mais en x250 la fermeture se fait à 0,20 % (liquidation à 0,35 %) au lieu de 0,70 % en x100 : le haircut
+  sur de petits mouvements pèse plus, et le coût par PAPER est ~1,5 à 2 fois celui de x100 selon l'hypothèse.
+  Si la file d'attente des profits de PaperTrade est active, le gain de la jambe gagnante n'est pas disponible
+  tout de suite et les cycles s'arrêtent plus tôt.
 - **Le coût par PAPER a augmenté.** rusk0f s'est arrêté quand un cycle dépassait 7 $/1 000 PAPER. Si l'émission
   actuelle est déjà basse, le plafond se déclenchera vite. `python -m ptbot plan` l'estime avant de lancer.
 - **Risques du protocole.** Contrats non vérifiés et upgradables, LP unique, profits mis en file d'attente si la
-  LP manque de liquidités, PAPER non transférable pour l'instant. Un gap de prix au-delà de 0,95 % entre deux
+  LP manque de liquidités, PAPER non transférable pour l'instant. Un gap de prix au-delà de 0,35 % (x250) entre deux
   lectures liquide la jambe perdante (le bot le gère, mais le cycle coûte plus cher).
 - **Clés privées.** Le bot a besoin des clés des deux wallets : le staking et les retraits sont signés par le
   wallet principal. Utilisez deux wallets dédiés, ne mettez que ce que vous acceptez de perdre, gardez `.env` et
@@ -67,7 +69,7 @@ aussi exister sur Hyperliquid (HyperCore), puisque le rééquilibrage passe par 
 
 Le bot n'a jamais pu parler au vrai PaperTrade pendant son développement : l'API n'est pas documentée et le format
 exact de plusieurs réponses est deviné. Cette procédure vérifie chaque hypothèse **avec au plus 10 $ en jeu par
-wallet** avant de lui confier 150 $. `python -m ptbot run` refuse de démarrer tant que les étapes 6 et 8 n'ont pas
+wallet** avant de lui confier 100 $. `python -m ptbot run` refuse de démarrer tant que les étapes 6 et 8 n'ont pas
 réussi (session keys, mini-positions de test) et tant que l'horloge, les adresses de dépôt ou `balances()` ne sont
 pas conformes.
 
@@ -103,14 +105,15 @@ pas conformes.
 8. **Mini-position signée par le bot** (perte maximale 10 $ par wallet) :
    `python tools/preflight_tiny_trade.py --wallet A` (à blanc), puis
    `python tools/preflight_tiny_trade.py --wallet A --i-understand-this-trades`, et pareil pour B. Toutes les
-   lignes doivent être `PASS` ; notez les latences. Si l'ouverture met plus de 60 s ou la fermeture plus de 30 s,
-   baissez `CLOSE_MOVE_PCT` (0,60) ou montez `OPEN_DEADLINE_S` avant d'aller plus loin.
-9. **`python -m ptbot plan`** : marge, x100, sortie ±0,70 % contre liquidation ±0,95 %, émission, coût estimé.
-10. **Premier lancement réduit** : `MAX_MARGIN_USD=100` dans `.env`, puis `python -m ptbot run` et
+   lignes doivent être `PASS` ; notez les latences. Si l'ouverture met plus de 60 s, montez `OPEN_DEADLINE_S`. En
+   x250, 0,15 % seulement séparent la fermeture de la liquidation : si la fermeture met plus de 10 s, baissez le
+   levier (`LEVERAGE`/`MAX_LEVERAGE`) avant d'aller plus loin.
+9. **`python -m ptbot plan`** : marge 44 $, x250, sortie ±0,20 % contre liquidation ±0,35 %, émission, coût estimé.
+10. **Premier lancement supervisé** : `python -m ptbot run` et
     `tail -f data/bot.log`. Surveillez avec `python -m ptbot status` (pas avec le site). Vérifiez la ligne
     « Paire ouverte (A …, B …) », l'absence de « refusé », le temps entre « fermeture des deux jambes » et la
     disparition des positions, puis le premier rééquilibrage de bout en bout.
-11. **Après au moins 3 cycles propres** (coûts et PAPER cohérents avec le site), retirez `MAX_MARGIN_USD`.
+11. **Laissez-le tourner seul après au moins 3 cycles propres** (coûts et PAPER cohérents avec le site).
     Refaites l'étape 2 après toute mise à jour de PaperTrade (contrats upgradables).
 
 **Procédure d'urgence** : créez le fichier `STOP`, attendez l'arrêt du bot, fermez les deux jambes (`close-all`,
@@ -166,7 +169,8 @@ le fausserait. `stake-now` refuse tant qu'un cycle est en cours ; arrêtez d'abo
 
 | Variable | Défaut | Rôle |
 |---|---|---|
-| `LEVERAGE` / `MAX_LEVERAGE` | 100 / 100 | levier visé / levier max autorisé pour rester au notionnel minimum |
+| `LEVERAGE` / `MAX_LEVERAGE` | 250 / 250 | levier visé / levier max autorisé pour rester au notionnel minimum |
+| `TARGET_NOTIONAL_USD` | 11000 | marge par jambe = notionnel visé / levier (44 $ en x250) ; 0 = tout le solde |
 | `CLOSE_MOVE_PCT` | 0.70 | mouvement de prix qui déclenche la fermeture des 2 jambes |
 | `LIQ_SAFETY_PCT` | 0.15 | écart minimum gardé avant la liquidation (borne `CLOSE_MOVE_PCT`) |
 | `MARGIN_FRACTION` / `MAX_MARGIN_USD` | 1.0 / 0 | marge par jambe = plus petit solde × fraction (plafonnée) |

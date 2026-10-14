@@ -20,8 +20,9 @@ from .constants import LIQ_BUFFER
 @dataclass
 class Params:
     coin: str = "BTC"
-    leverage: int = 100
-    max_leverage: int = 100            # > leverage lets the bot go up to reach the minimum notional
+    leverage: int = 250
+    max_leverage: int = 250            # > leverage lets the bot go up to reach the minimum notional
+    target_notional: float = 11_000.0  # margin per leg = what this notional needs at `leverage` (0 = whole balance)
     close_move: float = 0.007          # close both legs once price moved 0.70% from entry
     liq_safety: float = 0.0015         # always close at least 0.15% before the liquidation price
     margin_fraction: float = 1.0       # share of the smaller balance used as margin per leg
@@ -69,8 +70,14 @@ def floor_cents(x: float) -> float:
     return math.floor(x * 100 + 1e-9) / 100
 
 
+def ceil_cents(x: float) -> float:
+    return math.ceil(x * 100 - 1e-9) / 100
+
+
 def plan_open(bal_a: float, bal_b: float, min_margin: float, min_notional: float, p: Params) -> OpenPlan | Skip:
     margin = floor_cents(min(bal_a, bal_b) * p.margin_fraction)
+    if p.target_notional > 0:
+        margin = min(margin, ceil_cents(p.target_notional / p.leverage))
     if p.max_margin_usd > 0:
         margin = min(margin, p.max_margin_usd)
     if margin < min_margin:

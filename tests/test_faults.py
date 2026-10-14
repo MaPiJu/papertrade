@@ -9,8 +9,8 @@ from ptbot.constants import SCALE
 from ptbot.papertrade_api import _list_payload
 from ptbot.positions import Position
 from ptbot.sim import SimVenue
-from ptbot.strategy import Params
 
+from . import x100
 from .test_bot import Path
 
 
@@ -108,7 +108,7 @@ class FaultVenue(SimVenue):
 def make(tmp_path, points, faults=None, usdc=100.0, params=None):
     venue = FaultVenue(Path(points), faults=faults, start_usdc=usdc, emission=50)
     store = StateStore(tmp_path / "state.json")
-    return venue, store, Bot(venue, params or Params(), store, Timing())
+    return venue, store, Bot(venue, params or x100(), store, Timing())
 
 
 def run_for(bot, seconds):
@@ -216,7 +216,7 @@ def test_crash_between_open_and_save_resumes_and_closes_the_lone_leg(tmp_path):
         bot.step()
     assert len(venue.accounts["A"].positions) == 1
     venue.faults = {}
-    bot2 = Bot(venue, Params(), StateStore(tmp_path / "state.json"), Timing())
+    bot2 = Bot(venue, x100(), StateStore(tmp_path / "state.json"), Timing())
     run_for(bot2, 330)  # B may have been signed late: the lone A leg is price-watched until B's order expires
     assert venue.max_positions <= 1
     assert bot2.st["totals"]["cycles"] == 1          # the aborted lone leg was closed and booked
@@ -236,7 +236,7 @@ def test_crash_after_withdraw_does_not_withdraw_twice(tmp_path):
             bot.step()
             venue.sleep(2)
     venue.faults = {}
-    bot2 = Bot(venue, Params(), StateStore(tmp_path / "state.json"), Timing())
+    bot2 = Bot(venue, x100(), StateStore(tmp_path / "state.json"), Timing())
     run_for(bot2, 120)
     assert venue.calls["withdraw", "A"] == 1
     assert venue.accounts["A"].core_spot == 0
@@ -319,7 +319,7 @@ def test_resume_file_clears_pause_and_counters_while_running(tmp_path):
     store.data.update(paused="test", open_failures=3)
     (tmp_path / "state.resume").write_text("")
     sim_store = StateStore(tmp_path / "sim_state.json")       # a simulation in the same directory
-    Bot(SimVenue(Path([(0, 100_000)])), Params(), sim_store, Timing()).step()
+    Bot(SimVenue(Path([(0, 100_000)])), x100(), sim_store, Timing()).step()
     assert (tmp_path / "state.resume").exists()               # ...does not eat the live bot's request
     bot.step()
     assert not store.data["paused"] and store.data["open_failures"] == 0
@@ -333,7 +333,7 @@ def test_old_state_mid_cycle_is_refused_with_a_message(tmp_path):
            "totals": {"cycles": 0, "usd_spent": 0.0, "paper_minted": 0.0, "paper_staked": 0.0}}
     (tmp_path / "state.json").write_text(__import__("json").dumps(old))
     with pytest.raises(IncompatibleState):
-        Bot(SimVenue(Path([(0, 100_000)])), Params(), StateStore(tmp_path / "state.json"), Timing())
+        Bot(SimVenue(Path([(0, 100_000)])), x100(), StateStore(tmp_path / "state.json"), Timing())
 
 
 def test_ghost_position_in_closing_pauses(tmp_path):
@@ -397,7 +397,7 @@ def test_queue_release_does_not_hide_an_invisible_leg(tmp_path):
 
     venue = Blind(Path([(0, 100_000)]), faults={("open", "B"): {"never": True}}, start_usdc=150, emission=50)
     store = StateStore(tmp_path / "state.json")
-    bot = Bot(venue, Params(), store, Timing())
+    bot = Bot(venue, x100(), store, Timing())
     run_for(bot, 20)
     venue.accounts["A"].usdc += venue.queued_usd   # release: queued -> free, equity unchanged
     venue.queued_usd = 0.0
@@ -444,7 +444,7 @@ def test_reset_costs_forgets_the_cumulative_baseline():
 def test_a_late_fill_of_another_size_is_never_adopted_as_a_leg(tmp_path):
     # B's own order fills 30 s late; meanwhile an earlier, differently sized order fills on B
     venue, store, bot = make(tmp_path, [(0, 100_000)], {("open", "B"): {"delay": 30}}, usdc=200,
-                             params=Params(max_margin_usd=100))
+                             params=x100(max_margin_usd=100))
     bot.step()                                                    # the pair's orders are sent
     assert store.data["phase"] == "opening"
     SimVenue.open(venue, "B", "BTC", False, 60.0, 200, 120)      # the earlier order's late fill
@@ -457,7 +457,7 @@ def test_a_late_fill_of_another_size_is_never_adopted_as_a_leg(tmp_path):
 
 
 def test_cycle_is_not_booked_while_a_stray_is_still_open(tmp_path):
-    venue, store, bot = make(tmp_path, [(0, 100_000), (60, 100_750)], usdc=200, params=Params(max_margin_usd=150))
+    venue, store, bot = make(tmp_path, [(0, 100_000), (60, 100_750)], usdc=200, params=x100(max_margin_usd=150))
     run_for(bot, 55)
     SimVenue.open(venue, "A", "BTC", True, 30.0, 400, 120)        # an unmanaged position appears
     venue.close_noops = 0
@@ -487,7 +487,7 @@ def test_pending_orders_are_cancelled_when_a_pair_is_abandoned(tmp_path):
     venue = Cancelling(Path([(0, 100_000), (20, 99_250)]), faults={("open", "B"): {"never": True}},
                        start_usdc=100, emission=50)
     store = StateStore(tmp_path / "state.json")
-    bot = Bot(venue, Params(), store, Timing())
+    bot = Bot(venue, x100(), store, Timing())
     run_for(bot, 40)                                              # A alone hits its exit: pair abandoned
     assert cancelled == [("B", "accepted")]
 

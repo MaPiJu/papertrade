@@ -83,14 +83,15 @@ pas conformes.
    paire ouverte demande d'agir en quelques minutes.
 2. **Contrôle en lecture seule** (sans clé, rien n'est dépensé) :
    `python tools/preflight_live.py --wallet-a <A> --wallet-b <B> --deposit-a <DEPOSIT_A> --deposit-b <DEPOSIT_B>`.
-   Tout `FAIL` est bloquant. Il faut notamment : décalage d'horloge < 5 s, `eip712Domain()` lisible (notez le nom
-   du domaine), minimums `(10.0, 10000.0)`, sur les comptes publics `ids N/N` sans `unknown`, `balances() return
+   Tout `FAIL` est bloquant. Il faut notamment : décalage d'horloge < 5 s, minimums `(10.0, 1000.0)` ou
+   `(10.0, 10000.0)`, sur les comptes publics `ids N/N` sans `unknown`, `balances() return
    size 32 bytes`, adresses de dépôt API = `.env`. Si `profit queue` est actif, `userQueuedTotal` doit être lisible.
-3. **`python -m ptbot probe`**, puis ouvrez `data/probe/probe.json` : domaines lus (pas `null`), soldes égaux à
+3. **`python -m ptbot probe`**, puis ouvrez `data/probe/probe.json` : soldes égaux à
    ceux du site, `usdc_queued` est un nombre, `trades_order`, `open_positions_parsed` vide si vous n'avez rien
    d'ouvert.
 4. **Position manuelle sur le site** (bot arrêté, avant d'enregistrer la clé du bot) : sur A, la plus petite
-   position possible (10 $ x1000). Pendant qu'elle est ouverte, relancez `probe` : `open_positions_parsed` doit la
+   position possible : 10 $ en x100 si `probe` affiche un minimum de 1 000 $ (`minimums_usd`), en x1000
+   s'il affiche 10 000 $. Pendant qu'elle est ouverte, relancez `probe` : `open_positions_parsed` doit la
    contenir (bon id, BTC, sens, prix d'entrée) et `usdc_papertrade` doit avoir baissé d'environ 10 $. Fermez-la (ou
    laissez-la liquider) et relancez `probe` : elle doit avoir disparu. **Sinon, n'allez pas plus loin** et
    envoyez-moi `trades_raw_first_page` pour adapter `ptbot/positions.py`.

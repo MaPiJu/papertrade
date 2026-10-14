@@ -1,6 +1,7 @@
-"""Supervised tiny live trade through the BOT'S OWN code (LiveVenue): 10$ margin x1000 = the
-10,000$ minimum notional; worst case = the 10$ margin (liquidation sits ~0.05% away, which also
-lets you capture a real liquidation event).
+"""Supervised tiny live trade through the BOT'S OWN code (LiveVenue): 10$ margin at the lowest
+leverage reaching the live minimum notional, but at least x100 (x100 with a 1,000$ minimum:
+liquidation 0.95% away, so the close path gets tested; x1000 with a 10,000$ minimum: liquidation
+~0.05% away, which mostly captures a liquidation event). Worst case = the 10$ margin.
 
 Validates, with real money but bounded: session-key registration and signing, relayer
 acceptance, intentId format (== EIP-712 digest?), submit->visible and close->gone latencies,
@@ -17,11 +18,16 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import sys
 import time
 from pathlib import Path
 
-MARGIN, LEVERAGE = 10.0, 1000
+MARGIN, MIN_LEVERAGE = 10.0, 100
+
+
+def tiny_leverage(min_notional: float) -> int:
+    return max(MIN_LEVERAGE, math.ceil(min_notional / MARGIN - 1e-9))
 
 
 def read_positions(venue, w, log):
@@ -88,12 +94,13 @@ def run(venue, w, really, log, state_file=None):
     if not really:
         log("dry run OK (domains resolved, reads work). Re-run with --i-understand-this-trades to trade.")
         return out, verdict
+    leverage = tiny_leverage(venue.minimums()[1])
     mid0 = venue.mid("BTC")
     t_submit = time.time()
-    intent = venue.open(w, "BTC", is_long, MARGIN, LEVERAGE, 120)
+    intent = venue.open(w, "BTC", is_long, MARGIN, leverage, 120)
     body = next(b for b, _ in sent if b["action"] == "openPosition")
     d = digest("OpenPosition", body["signed"], venue.domains)
-    step("open sent", intentId=intent, local_digest=d, mid=mid0, registered_now=any(b["action"] == "registerSessionKey" for b, _ in sent))
+    step("open sent", intentId=intent, local_digest=d, mid=mid0, leverage=leverage, registered_now=any(b["action"] == "registerSessionKey" for b, _ in sent))
     check(True, "relayer accepted the open (session key and signature not refused at intake)")
     verdict.append(("INFO", f"intentId == EIP-712 digest: {intent.lower() == d.lower()} (if True, a lost response can still be cancelled)"))
 

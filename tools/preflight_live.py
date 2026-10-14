@@ -129,8 +129,10 @@ def check_domains(net):
             res = eth_call(net, addr, "eip712Domain()")
         except Exception as e:
             msg = str(e)
-            lvl = "FAIL" if "revert" in msg.lower() and key == "exchange" else "WARN"
-            report(lvl, f"eip712Domain() {key}", f"unreadable: {msg[:90]} (revert = absent; anything else = retry)")
+            # Absent on-chain is expected: the website's own code signs with the same names as the bot
+            # (exchange String/1, PaperStaking/1, PaperTrade Intent Cancel/2, checked 14/10/2026).
+            report("WARN", f"eip712Domain() {key}", f"unreadable: {msg[:90]} (revert = absent, the bot's "
+                   "defaults are the website's; anything else = retry)")
             continue
         fields, name, version, chain, verifying, salt, ext = decode(out_types, bytes.fromhex(res[2:]))
         raw[f"eip712_{key}"] = {"fields": fields.hex(), "name": name, "version": version, "chainId": chain,

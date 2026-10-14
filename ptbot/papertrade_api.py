@@ -43,13 +43,13 @@ class PaperTradeApi:
         self.http = requests.Session()
         self.http.headers.update(HEADERS)
 
-    def _request(self, method: str, path: str, **kw):
+    def _request(self, method: str, path: str, timeout: float | None = None, retry: bool = True, **kw):
         # Only GETs are retried: a POSTed intent may already be queued even if the
         # response was lost, and resending it would be refused as a reused nonce.
-        delays = (0.5, 1.5, 4.0) if method == "GET" else ()
+        delays = (0.5, 1.5, 4.0) if method == "GET" and retry else ()
         for attempt in range(len(delays) + 1):
             try:
-                r = self.http.request(method, self.base + path, timeout=self.timeout, **kw)
+                r = self.http.request(method, self.base + path, timeout=timeout or self.timeout, **kw)
             except requests.RequestException:
                 if attempt == len(delays):
                     raise
@@ -61,8 +61,8 @@ class PaperTradeApi:
             return r
         raise RuntimeError("unreachable")
 
-    def get(self, path: str, params: dict | None = None):
-        r = self._request("GET", path, params=params)
+    def get(self, path: str, params: dict | None = None, timeout: float | None = None, retry: bool = True):
+        r = self._request("GET", path, timeout=timeout, retry=retry, params=params)
         r.raise_for_status()
         return r.json()
 
@@ -86,11 +86,11 @@ class PaperTradeApi:
         except Exception:
             return False
 
-    def account_trades(self, address: str, pages: int = 3) -> list:
+    def account_trades(self, address: str, pages: int = 3, timeout: float | None = None, retry: bool = True) -> list:
         items, cursor = [], None
         for _ in range(pages):
             data = self.get(f"/query/accounts/{address.lower()}/trades",
-                            params={"cursor": cursor} if cursor else None)
+                            params={"cursor": cursor} if cursor else None, timeout=timeout, retry=retry)
             items.extend(_list_payload(data))
             cursor = data.get("nextCursor") if isinstance(data, dict) else None
             if not cursor:

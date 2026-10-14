@@ -12,6 +12,10 @@ from .constants import EXCHANGE_CONTRACT, PAPER_STAKING, PAPER_TOKEN, PAPER_TOKE
 log = logging.getLogger(__name__)
 
 
+class ContractCallError(RuntimeError):
+    """The node answered the eth_call with an error (revert, missing function...)."""
+
+
 def selector(signature: str) -> bytes:
     return keccak(text=signature)[:4]
 
@@ -30,7 +34,7 @@ class HyperEvm:
         r.raise_for_status()
         body = r.json()
         if "error" in body:
-            raise RuntimeError(f"eth_call {signature}: {body['error']}")
+            raise ContractCallError(f"eth_call {signature}: {body['error']}")
         raw = bytes.fromhex(body["result"][2:])
         return decode(out_types, raw)
 

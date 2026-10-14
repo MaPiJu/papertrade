@@ -105,6 +105,8 @@ bot reprend le cycle en cours (`data/state.json`). Pour tout couper : `close-all
   était, sans rouvrir de paire ni retirer deux fois ;
 - une lecture d'API vide ou en retard ne ferme pas la paire et ne cache pas une position à fermer (3 lectures
   manquées d'affilée sont nécessaires) ; si le prix d'entrée est illisible, le bot retient le pire prix vu ;
+- si l'API des positions tombe pendant qu'une paire est ouverte, le bot continue de surveiller le prix toutes les
+  2 s et renvoie les fermetures à l'aveugle (une fermeture en double est sans effet) ;
 - chaque jambe sort sur son propre prix d'entrée, même si les deux ont été exécutées à des prix différents ;
 - les transferts lents (retrait vers HyperCore, crédit du dépôt) sont attendus jusqu'à 2 h, avec relance automatique
   si un retrait a expiré sans être exécuté ou si un envoi n'est jamais parti.
@@ -115,8 +117,11 @@ suivre.
 
 **Pauses** : le bot se met en pause (et continue de staker) quand le plafond de coût est atteint, quand un
 rééquilibrage reste bloqué 2 h, après 3 paires ratées d'affilée, si une position reste listée après 8 tentatives de
-fermeture, ou si les soldes bougent alors que l'API ne montre aucune position. Le motif est dans `data/bot.log`.
-Corrigez, puis `python -m ptbot resume`.
+fermeture (cette pause se lève d'elle-même si la position finit par disparaître), ou si les soldes bougent alors que
+l'API ne montre aucune position. Le motif est dans `data/bot.log`. Corrigez, puis `python -m ptbot resume`.
+
+**Ne stakez pas à la main pendant un cycle** : le PAPER du cycle est mesuré sur le solde non staké, un stake manuel
+le fausserait. `stake-now` refuse tant qu'un cycle est en cours ; arrêtez d'abord le bot (fichier `STOP`).
 
 ## Paramètres (.env)
 

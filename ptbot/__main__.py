@@ -198,6 +198,12 @@ def cmd_sim(settings, args) -> None:
 
 
 def cmd_stake_now(settings, args) -> None:
+    from .bot import StateStore
+
+    st = StateStore(settings.state_dir / "state.json").data
+    if (st.get("phase", "idle") != "idle" or st.get("cycle")) and not args.force:
+        raise SystemExit("Un cycle est en cours: un stake maintenant fausserait le compte de PAPER du cycle. "
+                         "Attendez la fin du cycle ou arrêtez le bot (fichier STOP), ou utilisez --force.")
     venue = build_live(settings)
     for w in settings.wallets:
         raw = venue.paper_raw(w)
@@ -219,7 +225,7 @@ def cmd_resume(settings, args) -> None:
     from .bot import StateStore, apply_resume
 
     # A running bot rewrites state.json every step: it picks the request up from this file instead.
-    (settings.state_dir / "RESUME").write_text("reset-costs" if args.reset_costs else "")
+    (settings.state_dir / "state.resume").write_text("reset-costs" if args.reset_costs else "")
     store = StateStore(settings.state_dir / "state.json")
     apply_resume(store.data, args.reset_costs)
     store.save()
@@ -244,7 +250,8 @@ def main(argv=None) -> None:
     s.add_argument("--vol", type=float, default=0.6, help="volatilité horaire en %%")
     s.add_argument("--seed", type=int, default=1)
     s.add_argument("--live-prices", action="store_true", help="prix BBO Hyperliquid réels, temps réel")
-    sub.add_parser("stake-now", help="stake tout le PAPER non staké des deux wallets")
+    sn = sub.add_parser("stake-now", help="stake tout le PAPER non staké des deux wallets")
+    sn.add_argument("--force", action="store_true", help="même si un cycle est en cours")
     sub.add_parser("close-all", help="ferme toutes les positions des deux wallets")
     rs = sub.add_parser("resume", help="lève la pause")
     rs.add_argument("--reset-costs", action="store_true", help="oublie l'historique de coût (plafond)")

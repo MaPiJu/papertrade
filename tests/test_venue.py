@@ -54,3 +54,28 @@ def test_stake_and_withdraw_are_signed_by_the_main_wallet(tmp_path):
     assert recover_signer("Stake", stake, DOMAINS) == venue.addr("B")
     assert recover_signer("WithdrawToCore", wd, DOMAINS) == venue.addr("B")
     assert wd["signed"]["amount"] == str(6543 * SCALE // 100)
+
+
+def test_queued_raises_on_network_errors_and_reads_zero_only_when_unsupported(tmp_path):
+    import pytest
+    import requests
+
+    from ptbot.chain import ContractCallError
+
+    class Evm:
+        def __init__(self, exc):
+            self.exc = exc
+
+        def queued_usdc(self, user):
+            raise self.exc
+
+    venue, _ = make(tmp_path)
+    venue.evm = Evm(requests.ReadTimeout("timed out"))
+    with pytest.raises(requests.ReadTimeout):         # transient: the bot retries instead of booking 0
+        venue.queued("A")
+    venue.evm = Evm(ContractCallError("eth_call userQueuedTotal(address): {'message': 'rate limited'}"))
+    with pytest.raises(ContractCallError):
+        venue.queued("A")
+    venue.evm = Evm(ContractCallError("eth_call userQueuedTotal(address): execution reverted"))
+    assert venue.queued("A") == 0.0                   # the getter does not exist on this contract
+    assert venue.queued("B") == 0.0

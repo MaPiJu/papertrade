@@ -92,12 +92,14 @@ class StateStore:
 
 def apply_resume(st: dict, reset_costs: bool = False) -> None:
     """Clears a pause and the failure counters that lead to one."""
-    st.update(paused=None, next_try=0, open_failures=0, stake_failures={}, stake_disabled_until={})
+    st.update(paused=None, paused_kind=None, next_try=0, open_failures=0, stake_failures={},
+              stake_disabled_until={})
     for s in st.get("strays", {}).values():
         s["attempts"] = 0
     if reset_costs:
         st["history"] = []
         st["cycles_all"] = []
+        st.pop("equity_first", None)
 
 
 def _arrived(delta: float, amount: float) -> bool:
@@ -149,7 +151,9 @@ class Bot:
                     errors += 1
                     self.store.save()
                     log.exception("Erreur pendant le cycle (nouvel essai au prochain tour)")
-                    self.v.sleep(min(5 * errors, 60))   # back off while an API is down
+                    # back off while an API is down, but keep watching the price while positions may be open
+                    exposed = self.st["phase"] in ("opening", "open", "closing")
+                    self.v.sleep(min(2 * errors, 6) if exposed else min(5 * errors, 60))
                 self.v.sleep(self.t.poll_s)
                 steps += 1
         finally:
@@ -171,7 +175,7 @@ class Bot:
         return lambda: [signal.signal(s, h) for s, h in old.items()]
 
     def step(self) -> None:
-        resume_file = self.store.path and self.store.path.parent / "RESUME"   # written by `python -m ptbot resume`
+        resume_file = self.store.path and self.store.path.with_suffix(".resume")   # from `python -m ptbot resume`
         if resume_file and resume_file.exists():
             self.resume(reset_costs="reset-costs" in resume_file.read_text())
             resume_file.unlink()
@@ -180,9 +184,17 @@ class Bot:
         handler(self.v.now())
         self.store.save()
 
-    def pause(self, reason: str) -> None:
+    def pause(self, reason: str, kind: str | None = None) -> None:
         self.st["paused"] = reason
+        self.st["paused_kind"] = kind
         log.error("PAUSE: %s (staking actif; `python -m ptbot resume` pour reprendre)", reason)
+
+    def _clear_pause(self, kind: str) -> None:
+        """Lifts a pause that was only about a position that has since gone away."""
+        if self.st.get("paused") and self.st.get("paused_kind") == kind:
+            log.info("La position en cause a disparu: fin de la pause")
+            self.st["paused"] = None
+            self.st["paused_kind"] = None
 
     def resume(self, reset_costs: bool = False) -> None:
         apply_resume(self.st, reset_costs)
@@ -223,7 +235,7 @@ class Bot:
             if s["attempts"] == self.t.max_close_sends:
                 self.pause(f"wallet {w}: position #{pid} toujours listée après {s['attempts']} fermetures. Si le "
                            "site la montre fermée, l'API est mal lue (`python -m ptbot probe`); sinon fermez-la "
-                           "à la main")
+                           "à la main", kind=f"stray:{w}:{pid}")
             try:
                 self.v.close(w, [pid])
             except Exception as e:
@@ -234,6 +246,7 @@ class Bot:
                 if s["misses"] >= self.t.missing_reads:
                     log.info("Wallet %s: position #%s fermée", w, s["id"])
                     del strays[key]
+                    self._clear_pause(f"stray:{key}")
 
     # --- idle: stake, clean up, rebalance, open the next pair ----------------
     def _idle(self, now: float) -> None:
@@ -289,6 +302,7 @@ class Bot:
         if gap > 0.5:
             self.st["totals"]["usd_offcycle"] += gap
             log.info("Hors cycle depuis le dernier bilan: -%.2f$ (frais de transfert, positions fermées hors cycle)", gap)
+        self.st["equity_after_last"] = equity
         cycle = {
             "n": self.st["totals"]["cycles"] + 1, "started": now, "coin": coin,
             "deadline": now + self.t.open_deadline_s + self.t.submit_margin_s,
@@ -407,10 +421,10 @@ class Bot:
             self.st["cycle"] = None
             self.st["phase"] = "idle"
             return
-        free_now = sum(self.v.usdc(w) for w in WALLETS)   # read before changing the state
+        equity_now = sum(self.v.usdc(w) + self.v.queued(w) for w in WALLETS)   # read before changing the state
         self.st["cycle"] = None
         self.st["phase"] = "idle"
-        if c["free_start"] - free_now >= 0.5 * c["margin"]:
+        if c["equity_start"] - equity_now >= 0.5 * c["margin"]:
             self.pause("les soldes ont baissé mais aucune position n'est visible via l'API: des positions "
                        "sont sans doute ouvertes. Vérifiez sur le site et lancez `python -m ptbot probe`")
             return
@@ -433,22 +447,27 @@ class Bot:
             self.st["phase"] = "closing"
             return
         if now >= c["next_poll"]:
-            listed = {w: self._read(w) for w in WALLETS}
-            c["next_poll"] = now + self.t.positions_every_s
-            for w in WALLETS:
-                self._sweep(w, listed[w], {c["legs"][w]["pos_id"]}, now)
-            for w in WALLETS:
-                leg = c["legs"][w]
-                if leg["pos_id"] in listed[w]:
-                    leg["miss"] = 0
-                    continue
+            # One wallet per poll, so a slow read never delays the price check above for long.
+            w = WALLETS[c.get("read_turn", 0) % len(WALLETS)]
+            c["next_poll"] = now + self.t.positions_every_s / len(WALLETS)
+            try:
+                listed = self._read(w)
+            except Exception as e:
+                log.warning("Positions de %s illisibles (%s): je continue de surveiller le prix", w, e)
+                return
+            self._sweep(w, listed, {c["legs"][w]["pos_id"]}, now)
+            leg = c["legs"][w]
+            if leg["pos_id"] in listed:
+                leg["miss"] = 0
+                c["read_turn"] = c.get("read_turn", 0) + 1
+            else:
                 leg["miss"] += 1
                 if leg["miss"] >= self.t.missing_reads or self._adverse(w, mid) >= liq_distance(c["leverage"]):
                     log.warning("Jambe %s disparue (liquidée ou fermée à la main): je ferme la paire", w)
                     self._send_close(now, list(WALLETS))  # both: if the "missing" one still exists, close it too
                     self.st["phase"] = "closing"
                     return
-                c["next_poll"] = now + self.t.fast_poll_s  # one miss may be a glitch: re-check quickly
+                c["next_poll"] = now + self.t.fast_poll_s  # one miss may be a glitch: re-check this wallet quickly
         if now - c.get("heartbeat", 0) >= self.t.heartbeat_s:
             c["heartbeat"] = now
             log.info("Paire ouverte: %s=%.2f, jambe la plus en perte %.3f%% (fermeture à %.2f%%)",
@@ -476,7 +495,16 @@ class Bot:
             return
         c["next_poll"] = now + self.t.fast_poll_s
         mid = self.v.mid(c["coin"])
-        listed = {w: self._read(w) for w in WALLETS}
+        try:
+            listed = {w: self._read(w) for w in WALLETS}
+        except Exception as e:
+            # Closes are idempotent: keep re-sending blindly the ones not yet confirmed gone.
+            log.warning("Positions illisibles (%s): je renvoie les fermetures à l'aveugle si besoin", e)
+            pending = [w for w in WALLETS if c["legs"][w]["pos_id"] is not None
+                       and c["legs"][w]["gone_reads"] < self.t.missing_reads]
+            if pending and self._should_resend(c, pending, mid, now):
+                self._send_close(now, pending)
+            return
         for w in WALLETS:
             self._sync_legs(w, listed[w], mid, now)
         visible, unconfirmed = [], []
@@ -495,16 +523,14 @@ class Bot:
                    and c["legs"][w]["status"] in MAYBE_EXECUTED and now < self.st["intents_valid_until"]]
         if visible:
             sends = max(c["legs"][w]["close_sends"] for w in visible)
-            urgent = any(self._adverse(w, mid) >= (c["close_move"] + liq_distance(c["leverage"])) / 2 for w in visible)
-            interval = self.t.close_retry_s if sends < self.t.max_close_sends else self.t.ghost_retry_s
-            if urgent or now - c["close_sent_at"] >= interval:
+            if self._should_resend(c, visible, mid, now):
                 log.warning("Toujours ouvert sur %s: je renvoie la fermeture", visible)
                 self._send_close(now, visible)
             if sends >= self.t.max_close_sends and not c.get("ghost_paused"):
                 c["ghost_paused"] = True
                 self.pause(f"positions {[c['legs'][w]['pos_id'] for w in visible]} toujours listées après "
                            f"{sends} fermetures. Si le site les montre fermées, l'API est mal lue; sinon fermez-les "
-                           "à la main")
+                           "à la main", kind="ghost")
         if visible or unconfirmed or waiting:
             c["settle_at"] = None
             return
@@ -514,16 +540,25 @@ class Bot:
         if now >= c["settle_at"]:
             self._book_cycle(now)
 
+    def _should_resend(self, c: dict, wallets: list[str], mid: float, now: float) -> bool:
+        """Re-send a close every close_retry_s (every ghost_retry_s after max_close_sends), and at
+        once when a leg is halfway from its exit to liquidation, unless it already looks like a ghost."""
+        sends = max(c["legs"][w]["close_sends"] for w in wallets)
+        urgent = any(self._adverse(w, mid) >= (c["close_move"] + liq_distance(c["leverage"])) / 2 for w in wallets)
+        interval = self.t.close_retry_s if sends < self.t.max_close_sends else self.t.ghost_retry_s
+        return (urgent and sends < self.t.max_close_sends) or now - c["close_sent_at"] >= interval
+
     def _book_cycle(self, now: float) -> None:
         c = self.st["cycle"]
         free = sum(self.v.usdc(w) for w in WALLETS)
         queued = sum(self.v.queued(w) for w in WALLETS)
         paper = (sum(self.v.paper_raw(w) for w in WALLETS) - c["paper_start"]) / SCALE
         legs_opened = sum(1 for leg in c["legs"].values() if leg["pos_id"] is not None)
-        returned = free - (c["free_start"] - legs_opened * c["margin"])
+        returned = free + queued - (c["equity_start"] - legs_opened * c["margin"])
         self.st["cycle"] = None
         self.st["phase"] = "idle"
         self.st["next_try"] = 0
+        self._clear_pause("ghost")
         if legs_opened and returned < 0.25 * c["margin"] and paper <= 0:
             # Neither margin came back nor PAPER was minted: the legs may just be invisible.
             self.pause("les positions ne sont plus visibles via l'API mais ni marge ni PAPER ne sont revenus: "
@@ -534,16 +569,21 @@ class Bot:
         tot = self.st["totals"]
         tot["cycles"] += 1
         tot["usd_spent"] += usd
-        tot["paper_minted"] += paper
         ea, eb = c["legs"]["A"]["entry"], c["legs"]["B"]["entry"]
         skewed = bool(ea and eb and abs(ea / eb - 1) > 0.002)  # legs filled far apart: not a normal cycle
         kind = "aborted" if c["aborted"] else "skewed" if skewed else "normal"
-        self.st["cycles_all"].append({"ts": now, "usd": usd, "paper": paper, "kind": kind})
-        del self.st["cycles_all"][:-1000]
+        if paper < 0:
+            # Some PAPER left the wallet during the cycle (a stake made by hand): the cycle's mint is unknown.
+            log.warning("Cycle #%d: PAPER du cycle inconnu (stake manuel pendant le cycle ?), exclu du plafond", c["n"])
+            kind, paper = "unknown", 0.0
+        tot["paper_minted"] += paper
+        if kind != "unknown":
+            self.st["cycles_all"].append({"ts": now, "usd": usd, "paper": paper, "kind": kind})
+            del self.st["cycles_all"][:-1000]
         if kind == "normal":
             self.st["history"].append({"ts": now, "usd": usd, "paper": paper})
             del self.st["history"][:-1000]
-        note = {"aborted": "(avorté) ", "skewed": "(entrées décalées) ", "normal": ""}[kind]
+        note = {"aborted": "(avorté) ", "skewed": "(entrées décalées) ", "normal": "", "unknown": "(PAPER inconnu) "}[kind]
         log.info("Cycle #%d %sterminé en %.0f min: coût %.2f$, +%s PAPER (%.2f$/1000). Total: %s PAPER pour %.2f$",
                  c["n"], note, (now - c["started"]) / 60, usd, f"{paper:,.0f}",
                  cost_per_1000(usd, paper), f"{tot['paper_minted']:,.0f}", tot["usd_spent"])
@@ -555,7 +595,8 @@ class Bot:
             self.pause(f"coût {avg:.2f}$/1000 PAPER sur {span} > plafond {self.p.max_cost_per_1000:.2f}$: "
                        "farming arrêté")
         elif overall > self.p.max_cost_per_1000 and (
-                len(everything) >= 3 or tot["usd_spent"] >= 0.25 * self.st.get("equity_first", float("inf"))):
+                len(everything) >= 3
+                or sum(x["usd"] for x in everything) >= 0.25 * self.st.get("equity_first", float("inf"))):
             self.pause(f"coût cumulé {overall:.2f}$/1000 PAPER (cycles avortés compris) > plafond "
                        f"{self.p.max_cost_per_1000:.2f}$: farming arrêté")
 
@@ -580,8 +621,9 @@ class Bot:
         if n >= 3:
             self.st["stake_failures"][w] = 0
             self.st["stake_disabled_until"][w] = now + self.t.stake_disable_s
-            log.error("Wallet %s: 3 stakes en échec, staking automatique suspendu %.0f h pour ce wallet "
-                      "(`python -m ptbot stake-now` ou le site). Le farming continue", w, self.t.stake_disable_s / 3600)
+            log.error("Wallet %s: 3 stakes en échec, staking automatique suspendu %.0f h pour ce wallet. Le "
+                      "farming continue. Pour staker à la main, arrêtez d'abord le bot (fichier STOP) puis "
+                      "`python -m ptbot stake-now`", w, self.t.stake_disable_s / 3600)
 
     def stake_if_needed(self, now: float, force: bool = False) -> None:
         """Stakes each wallet's whole unstaked PAPER once it reaches the threshold.
@@ -637,7 +679,8 @@ class Bot:
             if r["withdraw_attempts"] >= 3:
                 self._finish_rebalance(f"le retrait de {amount:.2f}$ depuis {src} n'a jamais été exécuté (3 essais)")
                 return
-            spot, perp, src_before = self.v.core_spot_usdc(src), self.v.core_perp_usdc(src), self.v.usdc(src)
+            spot, perp = self.v.core_spot_usdc(src), self.v.core_perp_usdc(src)
+            src_before = self.v.usdc(src) + self.v.queued(src)
             r.update(spot_before=spot, perp_before=perp, src_before=src_before)
             r["withdraw_attempts"] += 1
             self._set_step(r, "await_core", now)
@@ -664,7 +707,8 @@ class Bot:
                 r["perp_moves"] = r.get("perp_moves", 0) + 1
                 self.v.core_perp_to_spot(src, floor_cents(min(amount, in_perp)))
                 return
-            if waited > WITHDRAW_DEADLINE_S + self.t.indexer_slack_s and self.v.usdc(src) >= r["src_before"] - 0.5:
+            if (waited > WITHDRAW_DEADLINE_S + self.t.indexer_slack_s
+                    and self.v.usdc(src) + self.v.queued(src) >= r["src_before"] - 0.5):
                 log.warning("Rééquilibrage: le retrait a expiré sans être exécuté, nouvel essai")
                 self._set_step(r, "withdraw", now)
                 return
@@ -679,7 +723,8 @@ class Bot:
                 return
             dest = self.v.deposit_address(dst)
             if "dst_before" not in r:  # first attempt only: a retry must compare with the original balances
-                r["dst_before"], r["spot_before_send"] = self.v.usdc(dst), self.v.core_spot_usdc(src)
+                r["dst_before"] = self.v.usdc(dst) + self.v.queued(dst)
+                r["spot_before_send"] = self.v.core_spot_usdc(src)
             r["send_attempts"] += 1
             r["unsent_since"] = None
             self._set_step(r, "await_credit", now)
@@ -691,7 +736,7 @@ class Bot:
                 return
             log.info("Rééquilibrage: %.2f$ envoyés vers l'adresse de dépôt de %s (%s)", r["send_amount"], dst, dest)
         elif r["step"] == "await_credit":
-            if _arrived(self.v.usdc(dst) - r["dst_before"], r["send_amount"]):
+            if _arrived(self.v.usdc(dst) + self.v.queued(dst) - r["dst_before"], r["send_amount"]):
                 log.info("Rééquilibrage terminé: A=%.2f$, B=%.2f$", self.v.usdc("A"), self.v.usdc("B"))
                 self._finish_rebalance(None)
                 return

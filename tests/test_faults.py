@@ -317,10 +317,13 @@ def test_gateway_error_on_submit_is_ambiguous_not_a_refusal():
 def test_resume_file_clears_pause_and_counters_while_running(tmp_path):
     venue, store, bot = make(tmp_path, [(0, 100_000)])
     store.data.update(paused="test", open_failures=3)
-    (tmp_path / "RESUME").write_text("")
+    (tmp_path / "state.resume").write_text("")
+    sim_store = StateStore(tmp_path / "sim_state.json")       # a simulation in the same directory
+    Bot(SimVenue(Path([(0, 100_000)])), Params(), sim_store, Timing()).step()
+    assert (tmp_path / "state.resume").exists()               # ...does not eat the live bot's request
     bot.step()
     assert not store.data["paused"] and store.data["open_failures"] == 0
-    assert not (tmp_path / "RESUME").exists()
+    assert not (tmp_path / "state.resume").exists()
 
 
 def test_old_state_mid_cycle_is_refused_with_a_message(tmp_path):
@@ -341,3 +344,94 @@ def test_ghost_position_in_closing_pauses(tmp_path):
     venue.positions = lambda w: [Position(ghost, "BTC", True)] + real(w) if w == "A" else real(w)
     run_for(bot, 600)
     assert store.data["paused"] and "toujours listées" in store.data["paused"]
+
+
+def test_read_outage_while_open_keeps_watching_the_price(tmp_path):
+    # positions reads fail from t=10 s; the price crosses the exit at t=50 and the liquidation at t=60
+    venue, store, bot = make(tmp_path, [(0, 100_000), (50, 100_720), (60, 101_000)])
+    run_for(bot, 10)
+    assert store.data["phase"] == "open"
+    real = venue.positions
+
+    def broken(w):
+        raise RuntimeError("503")
+
+    venue.positions = broken
+    run_for(bot, 80)                       # the 10 s exit-to-liquidation window must not be missed
+    venue.positions = real
+    run_for(bot, 60)
+    assert venue.liquidations == 0
+    assert store.data["totals"]["cycles"] == 1
+
+
+def test_read_outage_while_closing_still_resends_the_close(tmp_path):
+    venue, store, bot = make(tmp_path, [(0, 100_000), (60, 100_720), (120, 100_850), (150, 101_000)])
+    run_for(bot, 50)
+    venue.close_noops = 1                  # B's (the loser's) first close is dropped by the relayer
+    real = venue.positions
+
+    def broken(w):
+        raise RuntimeError("503")
+
+    venue.positions = broken
+    run_for(bot, 120)                      # the close of B must be resent blindly before liquidation
+    venue.positions = real
+    run_for(bot, 60)
+    assert venue.liquidations == 0
+    assert all(not a.positions for a in venue.accounts.values())
+
+
+def test_queue_release_does_not_hide_an_invisible_leg(tmp_path):
+    # positions are invisible, B is refused; A's margin goes into a position nobody sees,
+    # while an earlier queued profit is released to A's free balance
+    class Blind(FaultVenue):
+        queued_usd = 80.0
+
+        def queued(self, w):
+            return self.queued_usd if w == "A" else 0.0
+
+        def positions(self, w):
+            return []
+
+    venue = Blind(Path([(0, 100_000)]), faults={("open", "B"): {"never": True}}, start_usdc=150, emission=50)
+    store = StateStore(tmp_path / "state.json")
+    bot = Bot(venue, Params(), store, Timing())
+    run_for(bot, 20)
+    venue.accounts["A"].usdc += venue.queued_usd   # release: queued -> free, equity unchanged
+    venue.queued_usd = 0.0
+    run_for(bot, 300)
+    assert store.data["paused"] and "aucune position n'est visible" in store.data["paused"]
+    assert venue.max_positions <= 1
+
+
+def test_manual_stake_during_a_cycle_does_not_trip_the_cap(tmp_path):
+    venue, store, bot = make(tmp_path, [(0, 100_000), (60, 100_750)], usdc=150)
+    venue.accounts["B"].paper_raw = 10_000 * SCALE
+    store.data["stake_disabled_until"] = {"A": 1e12, "B": 1e12}     # auto-staking suspended
+    run_for(bot, 30)
+    SimVenue.stake(venue, "B", 10_000 * SCALE)                        # the user stakes by hand mid-cycle
+    run_for(bot, 60)
+    assert store.data["totals"]["cycles"] == 1
+    assert not store.data["paused"]
+
+
+def test_ghost_pause_lifts_itself_when_the_position_finally_disappears(tmp_path):
+    venue, store, bot = make(tmp_path, [(0, 100_000), (60, 100_750)])
+    run_for(bot, 61)
+    real = venue.positions
+    ghost = store.data["cycle"]["legs"]["A"]["pos_id"]
+    venue.positions = lambda w: [Position(ghost, "BTC", True)] + real(w) if w == "A" else real(w)
+    run_for(bot, 200)
+    assert store.data["paused"]
+    venue.positions = real                 # the indexer catches up
+    run_for(bot, 60)
+    assert not store.data["paused"]
+    assert store.data["totals"]["cycles"] == 1
+
+
+def test_reset_costs_forgets_the_cumulative_baseline():
+    from ptbot.bot import apply_resume
+
+    st = {"history": [1], "cycles_all": [1], "equity_first": 300.0, "strays": {}}
+    apply_resume(st, reset_costs=True)
+    assert st["history"] == [] and st["cycles_all"] == [] and "equity_first" not in st

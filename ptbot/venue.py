@@ -14,7 +14,7 @@ from pathlib import Path
 
 from eth_account import Account
 
-from .chain import HyperEvm
+from .chain import ContractCallError, HyperEvm
 from .constants import (FEE_ADDRESS, INSTRUMENTS, SCALE, SESSION_KEY_LIFETIME_S, STAKE_DEADLINE_S,
                         WITHDRAW_DEADLINE_S)
 from .hyperliquid import HyperliquidInfo, HyperliquidTransfers
@@ -51,6 +51,7 @@ class LiveVenue:
         self._keys_file = state_dir / "session_keys.json"
         self._minimums: tuple[float, float] | None = None
         self._minimums_at = 0.0
+        self._queued_unsupported = False
 
     # --- clock -----------------------------------------------------------
     def now(self) -> float:
@@ -67,16 +68,27 @@ class LiveVenue:
         return self.evm.usdc_balance(self.addr(w))
 
     def queued(self, w: str) -> float:
+        """Profit waiting in the FIFO queue. A network error raises (the caller retries);
+        only a getter that does not exist on the contract reads as 0 (its name comes from
+        bytecode analysis)."""
+        if self._queued_unsupported:
+            return 0.0
         try:
             return self.evm.queued_usdc(self.addr(w))
-        except Exception:
+        except ContractCallError as e:
+            if "revert" not in str(e).lower():
+                raise
+            self._queued_unsupported = True
+            log.warning("userQueuedTotal() indisponible on-chain (%s): profits en file d'attente non comptés", e)
             return 0.0
 
     def paper_raw(self, w: str) -> int:
         return self.evm.paper_balance_raw(self.addr(w))
 
     def positions(self, w: str) -> list[Position]:
-        return open_positions(self.api.account_trades(self.addr(w)))
+        # Short timeout and no retry: the bot polls again in a few seconds, and a slow read
+        # must not hold up the price checks that protect an open pair.
+        return open_positions(self.api.account_trades(self.addr(w), timeout=5.0, retry=False))
 
     def mid(self, coin: str) -> float:
         return self.hl.bbo_mid(coin)

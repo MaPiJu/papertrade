@@ -103,3 +103,34 @@ def test_rebalance_never_under_the_core_transfer_minimum():
     from ptbot.strategy import MIN_CORE_TRANSFER_USD
     assert plan_rebalance(40, 60, x100(min_rebalance_usd=1)) is None    # 10$ < 11 USDC, whatever the setting
     assert plan_rebalance(38, 62, x100()).amount == 12.0 >= MIN_CORE_TRANSFER_USD
+
+
+def test_win_payout_matches_real_trades():
+    from ptbot.strategy import cost_per_1000_at, win_payout
+    # position 596121: short, 1.6M$ notional, entry 83378.5 -> exit 82687.5; adjusted 11639.71$ before the 2% fee
+    move = (83378.5 - 82687.5) / 83378.5
+    assert abs(1_600_000 * win_payout(move) / 0.98 - 11639.71) < 2
+    # position 573718: short, 40k$ notional, entry 83668.5 -> exit 82676.5; adjusted 419.43$
+    move = (83668.5 - 82676.5) / 83668.5
+    assert abs(40_000 * win_payout(move) / 0.98 - 419.43) < 0.1
+    assert win_payout(0.00001) == 0.0
+    assert abs(cost_per_1000_at(0.02, 18.9) - 6.87) < 0.01 and abs(cost_per_1000_at(0.002, 18.9) - 10.96) < 0.01
+
+
+def test_ladder_sizing_lets_the_losing_side_pay_a_whole_period():
+    from ptbot.strategy import cost_per_1000_at, ladder_reset_move, plan_ladder
+    p = Params(strategy="ladder", ladder_step=0.0025, max_cost_per_1000=7.0)
+    reset = ladder_reset_move(18.9, p)
+    assert cost_per_1000_at(reset, 18.9) <= 7.0 * 0.98 < cost_per_1000_at(reset - 0.0005, 18.9)
+    two = plan_ladder({"A": 54.1, "B": 55.4}, 10, 1000, 18.9, p)
+    assert two.reset == reset and two.close_move == 0.0025
+    assert 1 / two.leverage - 0.0005 - 0.0025 >= p.liq_safety - 1e-9            # liquidation stays 0.15% away
+    assert 2 * two.margin + (reset + 0.0025) * two.notional <= 54.1 + 0.01      # B alone can pay a whole period
+    one = plan_ladder({"A": 109.0, "B": 0.0}, 10, 1000, 18.9, Params(strategy="ladder", one_wallet=True))
+    assert 3 * one.margin + (reset + 0.0025) * one.notional <= 109.0 + 0.01
+    assert one.notional > 1.6 * two.notional                                    # one pool funds both sides
+    small = plan_ladder({"A": 50.0, "B": 50.0}, 10, 1000, 18.9, p)               # min margin: lower leverage
+    assert 10 < small.margin < 10.5 and small.leverage < two.leverage            # room to shrink with the price
+    assert isinstance(plan_ladder({"A": 12.0, "B": 12.0}, 10, 1000, 18.9, p), Skip)
+    assert isinstance(plan_ladder({"A": 54.0, "B": 54.0}, 10, 1000, 16.5, p), Skip)  # no move is cheap enough
+    assert plan_ladder({"A": 60.0, "B": 60.0}, 10, 1000, None, Params(ladder_reset=0.03)).reset == 0.03

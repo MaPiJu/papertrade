@@ -49,6 +49,9 @@ def load_settings(env_file: str = ".env", need_keys: bool = True) -> Settings:
     if coin not in INSTRUMENTS:
         raise SystemExit(f"COIN doit être l'un de {list(INSTRUMENTS)}")
     leverage = int(_f("LEVERAGE", 250))
+    strategy = os.getenv("STRATEGY", "ladder").strip().lower()
+    if strategy not in ("ladder", "pair"):
+        raise SystemExit("STRATEGY doit valoir ladder ou pair")
     params = Params(
         coin=coin,
         leverage=leverage,
@@ -63,6 +66,11 @@ def load_settings(env_file: str = ".env", need_keys: bool = True) -> Settings:
         stake_threshold=_f("STAKE_THRESHOLD_PAPER", 1000),
         max_cost_per_1000=_f("MAX_COST_PER_1000_PAPER", 7),
         cost_window=int(_f("COST_WINDOW", 1)),
+        strategy=strategy,
+        ladder_step=_pct("LADDER_STEP_PCT", 0.25),
+        ladder_reset=_pct("LADDER_RESET_PCT", 0),
+        ladder_max_leverage=int(_f("LADDER_MAX_LEVERAGE", 1000)),
+        one_wallet=os.getenv("ONE_WALLET", "false").lower() in ("1", "true", "yes", "oui"),
     )
     return Settings(
         wallets=wallets,

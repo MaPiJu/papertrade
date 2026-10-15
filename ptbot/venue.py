@@ -68,6 +68,8 @@ class LiveVenue:
         self._minimums_at = 0.0
         self._queued_unsupported = False
         self._last_register: dict[str, float] = {}
+        self._emission: float | None = None
+        self._emission_at = 0.0
 
     # --- clock -----------------------------------------------------------
     def now(self) -> float:
@@ -120,6 +122,18 @@ class LiveVenue:
 
     def trading_paused(self) -> bool:
         return self.api.trading_paused()
+
+    def paper_emission(self) -> float | None:
+        """PAPER per $ lost: the website's own formula, else the on-chain getters (cached 5 min)."""
+        if time.time() - self._emission_at > 300:
+            try:
+                value = self.api.emission()
+            except Exception as e:
+                log.debug("Émission illisible via l'API (%s), lecture on-chain", e)
+                value = self.evm.emission_per_usd()
+            if value:
+                self._emission, self._emission_at = value, time.time()
+        return self._emission
 
     def core_spot_usdc(self, w: str) -> float:
         return self.hl.spot_usdc(self.addr(w))

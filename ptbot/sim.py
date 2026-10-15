@@ -1,10 +1,8 @@
 """Offline PaperTrade simulator, same interface as LiveVenue.
 
-Mechanics modelled from the docs and community measurements (estimates):
-  - open/close at the BBO mid, no fees, no funding;
-  - loss: PAPER = (loss - 2%) x emission; liquidation: PAPER = margin x emission;
-  - profit: haircut h(m) = 1 - (1-b)·m'/(m'+K), m' = move - 0.2 bps.
-    b=0.10, K=0.000216 reproduce ~48% kept at 0.03%, ~74% at 0.1%, ~88% at 1%.
+Mechanics checked against real trades (strategy.win_payout): open and close at the mid, no
+opening fee, no funding; a loss mints PAPER on 98% of it; a gain goes through the docs'
+asymmetric impact and a 2% fee. Liquidation: PAPER minted on the margin (not verified).
 """
 from __future__ import annotations
 
@@ -17,24 +15,7 @@ from dataclasses import dataclass, field
 from .constants import SCALE
 from .papertrade_api import IntentRejected
 from .positions import Position
-from .strategy import liq_distance
-
-DEADBAND = 0.00002
-
-# (b, K) hypotheses for the profit haircut, from most to least favourable:
-# community measurements after launch, rusk0f's reported costs, pre-launch bytecode reading.
-HAIRCUT_MODELS = {
-    "optimiste": (0.10, 0.000216),
-    "rusk0f": (0.10, 0.001868),
-    "pessimiste": (0.10, 0.0101),
-}
-
-
-def haircut(move: float, b: float, k: float) -> float:
-    m = move - DEADBAND
-    if m <= 0:
-        return 1.0
-    return 1 - (1 - b) * m / (m + k)
+from .strategy import MINT_FACTOR, liq_distance, win_payout
 
 
 @dataclass
@@ -77,12 +58,9 @@ class RandomWalk:
 
 class SimVenue:
     def __init__(self, price_fn, start_usdc: float = 100.0, emission: float = 50.0,
-                 haircut_b: float = 0.10, haircut_k: float = 0.000216, loss_fee: float = 0.02,
                  min_margin: float = 10.0, min_notional: float = 10_000.0, realtime: bool = False) -> None:
         self.price_fn = price_fn
         self.emission = emission
-        self.b, self.k = haircut_b, haircut_k
-        self.loss_fee = loss_fee
         self.mins = (min_margin, min_notional)
         self.realtime = realtime
         self.clock = time.time() if realtime else 1_800_000_000.0
@@ -139,6 +117,9 @@ class SimVenue:
     def trading_paused(self) -> bool:
         return False
 
+    def paper_emission(self) -> float:
+        return self.emission
+
     def core_spot_usdc(self, w: str) -> float:
         return self.accounts[w].core_spot
 
@@ -170,13 +151,13 @@ class SimVenue:
                 continue
             px = self.mid(p.coin)
             move = (px - p.entry) / p.entry * (1 if p.is_long else -1)
-            pnl = p.margin * p.leverage * move
-            if pnl < 0:
-                loss = min(-pnl, p.margin)
+            notional = p.margin * p.leverage
+            if move < 0:
+                loss = min(-move * notional, p.margin)
                 acc.usdc += p.margin - loss
-                acc.paper_raw += int(loss * (1 - self.loss_fee) * self.emission * SCALE)
+                acc.paper_raw += int(loss * MINT_FACTOR * self.emission * SCALE)
             else:
-                acc.usdc += p.margin + pnl * (1 - haircut(move, self.b, self.k))
+                acc.usdc += p.margin + notional * win_payout(move, p.coin)
         return "sim-close"
 
     def stake(self, w: str, amount_raw: int) -> str:

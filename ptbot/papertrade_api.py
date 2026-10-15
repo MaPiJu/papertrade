@@ -178,6 +178,15 @@ class PaperTradeApi:
     def trades_order(self, address: str) -> str | None:
         return self._orders.get(address.lower())
 
+    def emission(self) -> float | None:
+        """PAPER minted per $ (before the 2% deduction), as the website computes it from
+        /query/protocol/summary: rate while the tracked LP is under the cliff, then
+        rate x (decay / (decay + tailProgress))^2."""
+        paper = self.get("/query/protocol/summary", timeout=10).get("paper") or {}
+        tracked, cliff, rate, decay, tail = (int(paper[k]) / SCALE for k in
+                                             ("trackedLp", "cliff", "rate", "decay", "tailProgress"))
+        return rate if tracked < cliff else rate * (decay / (decay + tail)) ** 2
+
     def queue_total(self) -> float:
         """Total profit waiting in the protocol's FIFO queue (USD)."""
         data = self.get("/query/protocol/queue-summary")

@@ -62,7 +62,7 @@ def test_rebalance_after_cycle_equalises_wallets(tmp_path):
     run_for(bot, 1200)
     a, b = venue.accounts["A"], venue.accounts["B"]
     free = {w: acc.usdc + sum(p.margin for p in acc.positions.values()) for w, acc in venue.accounts.items()}
-    assert abs(free["A"] - free["B"]) < 1.0
+    assert abs(free["A"] - free["B"]) < 2.0      # transfers are whole USDC: at most 2$ apart
     assert a.core_spot == 0 and b.core_spot == 0
 
 

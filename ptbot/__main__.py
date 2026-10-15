@@ -69,6 +69,7 @@ def cmd_probe(settings, args) -> None:
         "eip712_defaults": {"exchange": DOMAIN_EXCHANGE, "staking": DOMAIN_STAKING},
         "mid": _try(hl.bbo_mid, settings.params.coin),
         "emission_paper_per_usd": _try(evm.emission_per_usd),
+        "emission_site_formula": _try(api.emission),
         "wallets": {},
     }
     for label, w in settings.wallets.items():
@@ -119,7 +120,15 @@ def cmd_status(settings, args) -> None:
     for w in WALLETS:
         print(f"Wallet {w} {venue.addr(w)}: {venue.usdc(w):.2f} USDC, "
               f"{venue.paper_raw(w) / SCALE:,.0f} PAPER non stakés, positions {[p.id for p in venue.positions(w)]}")
-    print(f"Phase: {st['phase']}  Pause: {st.get('paused')}")
+    print(f"Phase: {st['phase']}  Pause: {st.get('paused')}  Stratégie: {settings.params.strategy}"
+          f"{' (un wallet)' if settings.params.one_wallet else ''}")
+    c = st.get("cycle")
+    if c:
+        legs = ", ".join(f"{'long' if leg == 'A' else 'short'} #{c['legs'][leg]['pos_id']} @ {c['legs'][leg]['entry']}"
+                         for leg in ("A", "B"))
+        extra = (f", réarmement à -{c['close_move']:.2%}, encaissement à +{c['reset']:.2%}, "
+                 f"{c.get('rearms', 0)} réarmement(s)" if c.get("mode") == "ladder" else f", fermeture à ±{c['close_move']:.2%}")
+        print(f"Cycle #{c['n']} ({c.get('mode', 'pair')}): {legs}{extra}")
     for w in WALLETS:
         expiry = venue.key_expiry(w)
         print(f"Session key {w}: " + (f"expire dans {(expiry - time.time()) / 86400:.1f} jours" if expiry else "absente"))
@@ -132,37 +141,60 @@ def cmd_status(settings, args) -> None:
 
 def cmd_plan(settings, args) -> None:
     """Read-only: what the bot would do right now."""
-    from .sim import HAIRCUT_MODELS, haircut
-    from .strategy import Skip, plan_open, plan_rebalance
+    import math
+
+    from .strategy import (MIN_CORE_TRANSFER_USD, MINT_FACTOR, Skip, cost_per_1000_at, plan_ladder, plan_open,
+                           plan_rebalance, win_payout)
 
     venue = build_live(settings)
     p = settings.params
     bal = {w: venue.usdc(w) for w in ("A", "B")}
     mins = venue.minimums()
+    emission = venue.paper_emission()
     print(f"Soldes PaperTrade: A={bal['A']:.2f}$  B={bal['B']:.2f}$   minimums: marge {mins[0]:.2f}$, notionnel {mins[1]:,.0f}$")
-    t = plan_rebalance(bal["A"], bal["B"], p, mins)
-    if t:
-        print(f"-> d'abord rééquilibrer: {t.amount:.2f}$ de {t.src} vers {t.dst}")
-        half = (bal["A"] + bal["B"]) / 2
-        bal = {"A": half, "B": half}
-    plan = plan_open(bal["A"], bal["B"], *mins, p)
+    print(f"Émission: {f'~{emission:.2f} PAPER par $ perdu' if emission else 'illisible'}   stratégie: {p.strategy}"
+          f"{', un seul wallet (A)' if p.one_wallet else ''}")
+    if p.one_wallet:
+        moved = float(math.floor(bal["B"]))
+        if moved >= MIN_CORE_TRANSFER_USD:
+            print(f"-> d'abord transférer {moved:.0f}$ de B vers A (tout se joue ensuite sur A)")
+            bal = {"A": bal["A"] + moved - 1, "B": bal["B"] - moved}
+    else:
+        t = plan_rebalance(bal["A"], bal["B"], p, mins)
+        if t:
+            print(f"-> d'abord rééquilibrer: {t.amount:.2f}$ de {t.src} vers {t.dst}")
+            half = (bal["A"] + bal["B"]) / 2
+            bal = {"A": half, "B": half}
+    if p.strategy == "ladder":
+        plan = plan_ladder(bal, *mins, emission, p)
+    elif p.one_wallet:
+        plan = plan_open(bal["A"] / 2, bal["A"] / 2, *mins, p)
+    else:
+        plan = plan_open(bal["A"], bal["B"], *mins, p)
     if isinstance(plan, Skip):
         print(f"-> pas de cycle: {plan.reason}")
         return
-    loss = plan.notional * plan.close_move
-    print(f"-> cycle: marge {plan.margin:.2f}$ x{plan.leverage} sur chaque wallet ({plan.notional:,.0f}$ de notionnel), "
-          f"fermeture à ±{plan.close_move:.2%}; la jambe perdante perd ~{loss:.2f}$ et mint ~{loss * 0.98:.2f} x E PAPER")
-    emission = venue.evm.emission_per_usd()
-    print(f"   émission E: {f'~{emission:.1f} PAPER/$ (on-chain)' if emission else 'illisible on-chain'}")
-    print("   Le haircut réel est inconnu; coût estimé selon 3 hypothèses:")
-    for name, (b, k) in HAIRCUT_MODELS.items():
-        h = haircut(plan.close_move, b, k)
-        e_cap = h / 0.98 / p.max_cost_per_1000 * 1000
-        line = f"     {name:10} haircut {h:4.0%}: coût ~{loss * h:6.2f}$ par cycle, plafond {p.max_cost_per_1000}$/1000 atteint sous E={e_cap:.0f}"
-        if emission:
-            line += f" -> ~{loss * h / (loss * 0.98 * emission) * 1000:.2f}$/1000 aujourd'hui"
-        print(line)
-    print("   Le coût réel est mesuré après chaque cycle; avec COST_WINDOW=1 le bot s'arrête dès le premier cycle trop cher.")
+    if p.strategy == "ladder":
+        step_loss = plan.notional * plan.close_move
+        cost = plan.notional * (plan.reset - win_payout(plan.reset, p.coin))
+        print(f"-> échelle: long + short de {plan.margin:.2f}$ x{plan.leverage} ({plan.notional:,.0f}$ de notionnel "
+              f"chacun){' sur A' if p.one_wallet else ''}")
+        print(f"   la jambe qui perd {plan.close_move:.2%} est fermée et rouverte (~{step_loss:.2f}$ de perte, "
+              f"~{step_loss * MINT_FACTOR * (emission or 0):,.0f} PAPER par marche); liquidation à "
+              f"{1 / plan.leverage - 0.0005:.2%}")
+        print(f"   période terminée quand l'autre jambe gagne {plan.reset:.2%}: ~{plan.reset / plan.close_move:.0f} "
+              f"marches, ~{plan.notional * plan.reset * MINT_FACTOR * (emission or 0):,.0f} PAPER pour ~{cost:.2f}$"
+              + (f" (~{cost_per_1000_at(plan.reset, emission, p.coin):.2f}$/1000, plafond {p.max_cost_per_1000:.2f}$)"
+                 if emission else ""))
+    else:
+        loss = plan.notional * plan.close_move
+        cost = plan.notional * (plan.close_move - win_payout(plan.close_move, p.coin))
+        print(f"-> paire: marge {plan.margin:.2f}$ x{plan.leverage} par jambe ({plan.notional:,.0f}$ de notionnel), "
+              f"fermeture à ±{plan.close_move:.2%}: la jambe perdante perd ~{loss:.2f}$ "
+              f"(~{loss * MINT_FACTOR * (emission or 0):,.0f} PAPER), coût net ~{cost:.2f}$"
+              + (f" (~{cost_per_1000_at(plan.close_move, emission, p.coin):.2f}$/1000, plafond "
+                 f"{p.max_cost_per_1000:.2f}$)" if emission else ""))
+    print(f"   Le coût réel est mesuré après chaque période et comparé au plafond sur {p.cost_window} période(s).")
 
 
 def cmd_register(settings, args) -> None:
@@ -181,16 +213,20 @@ def startup_problems(settings, venue) -> list[str]:
     if not venue.keys_ready():
         problems.append("session keys absentes ou proches de l'expiration: `python -m ptbot register`, "
                         "puis attendez 5 minutes")
-    for w in settings.wallets:
-        path = settings.state_dir / "preflight" / f"tiny_trade_{w}.json"
+    checks = [(w, "tiny_trade", "visible", "mini-position de test du wallet", "--wallet {w}")
+              for w in (("A",) if settings.params.one_wallet else settings.wallets)]
+    if settings.params.one_wallet:
+        checks.append(("A", "straddle", "coexist", "test long + short sur le wallet", "--wallet {w} --straddle"))
+    for w, name, key, what, flags in checks:
+        path = settings.state_dir / "preflight" / f"{name}_{w}.json"
         try:
             verdict = json.loads(path.read_text()).get("verdict", [])
         except (FileNotFoundError, ValueError):
-            problems.append(f"mini-position de test du wallet {w} jamais faite: "
-                            f"`python tools/preflight_tiny_trade.py --wallet {w} --i-understand-this-trades`")
+            problems.append(f"{what} {w} jamais fait: "
+                            f"`python tools/preflight_tiny_trade.py {flags.format(w=w)} --i-understand-this-trades`")
             continue
-        if any(v[0] == "FAIL" for v in verdict) or not any(v[0] == "PASS" and "visible" in v[1] for v in verdict):
-            problems.append(f"mini-position de test du wallet {w} en échec ({path}): ne lancez pas le bot")
+        if any(v[0] == "FAIL" for v in verdict) or not any(v[0] == "PASS" and key in v[1] for v in verdict):
+            problems.append(f"{what} {w} en échec ({path}): ne lancez pas le bot")
     for w, wallet in settings.wallets.items():
         if not wallet.deposit_address:
             problems.append(f"DEPOSIT_ADDRESS_{w} manquante dans .env")
@@ -268,7 +304,8 @@ def cmd_sim(settings, args) -> None:
         price_fn = lambda now: hl.bbo_mid(settings.params.coin)  # noqa: E731
     else:
         price_fn = RandomWalk(vol_per_hour=args.vol / 100, seed=args.seed)
-    venue = SimVenue(price_fn, start_usdc=args.usdc, emission=args.emission, realtime=args.live_prices)
+    venue = SimVenue(price_fn, start_usdc=args.usdc, emission=args.emission, min_notional=args.min_notional,
+                     realtime=args.live_prices)
     sim_state = settings.state_dir / "sim_state.json"
     sim_state.unlink(missing_ok=True)  # fresh state every simulation
     store = StateStore(sim_state)
@@ -278,7 +315,9 @@ def cmd_sim(settings, args) -> None:
     t = store.data["totals"]
     staked = sum(a.staked_raw for a in venue.accounts.values()) / SCALE
     left = sum(a.usdc + sum(p.margin for p in a.positions.values()) for a in venue.accounts.values())
-    print(f"\nSimulation {args.hours}h: {t['cycles']} cycles, {t['paper_minted']:,.0f} PAPER générés, "
+    print(f"\nSimulation {args.hours}h ({settings.params.strategy}"
+          f"{', un wallet' if settings.params.one_wallet else ''}): {t['cycles']} cycles, "
+          f"{t['paper_minted']:,.0f} PAPER générés ({t['paper_minted'] / args.hours * 24:,.0f}/jour), "
           f"{staked:,.0f} stakés, coût {t['usd_spent']:.2f}$ "
           f"({t['usd_spent'] / max(t['paper_minted'], 1e-9) * 1000:.2f}$/1000), liquidations {venue.liquidations}, "
           f"USDC restants (marge en position incluse) {left:.2f}$, pause: {store.data.get('paused')}")
@@ -319,6 +358,31 @@ def cmd_close_all(settings, args) -> None:
         print(f"Wallet {w}: fermeture demandée pour {ids}")
 
 
+def cmd_close_cycle(settings, args) -> None:
+    """Closes the current cycle the way the bot would (cancels pending orders, closes both legs,
+    books the cost and PAPER), then stops without opening another one."""
+    from .bot import Bot, StateStore, Timing
+
+    state = settings.state_dir / "state.json"
+    if state.exists() and time.time() - state.stat().st_mtime < 30 and not args.force:
+        raise SystemExit("Le bot semble tourner (state.json modifié il y a moins de 30 s): créez le fichier STOP, "
+                         "attendez qu'il s'arrête, puis relancez close-cycle (ou --force).")
+    store = StateStore(state)
+    bot = Bot(build_live(settings), settings.params, store, Timing(open_deadline_s=settings.open_deadline_s))
+    phase = bot.st["phase"]
+    if phase == "idle":
+        print("Aucun cycle en cours.")
+        return
+    if phase == "rebalancing":
+        raise SystemExit("Un transfert entre wallets est en cours: laissez le bot le terminer (`run`), puis recommencez.")
+    if phase != "closing":
+        bot._end_period(bot.v.now(), "fermeture demandée (close-cycle)")
+        store.save()
+    bot.run(stop_when_idle=True)
+    t = bot.st["totals"]
+    print(f"Cycle fermé et compté. Total: {t['cycles']} cycles, {t['paper_minted']:,.0f} PAPER pour {t['usd_spent']:.2f}$")
+
+
 def cmd_resume(settings, args) -> None:
     from .bot import StateStore, apply_resume
 
@@ -345,7 +409,8 @@ def main(argv=None) -> None:
     s = sub.add_parser("sim", help="simulation hors-ligne de la stratégie")
     s.add_argument("--hours", type=float, default=24)
     s.add_argument("--usdc", type=float, default=100, help="USDC de départ par wallet")
-    s.add_argument("--emission", type=float, default=50, help="PAPER par $ perdu")
+    s.add_argument("--emission", type=float, default=18.9, help="PAPER par $ perdu")
+    s.add_argument("--min-notional", type=float, default=1000, help="notionnel minimum d'une position")
     s.add_argument("--vol", type=float, default=0.6, help="volatilité horaire en %%")
     s.add_argument("--seed", type=int, default=1)
     s.add_argument("--live-prices", action="store_true", help="prix BBO Hyperliquid réels, temps réel")
@@ -353,6 +418,8 @@ def main(argv=None) -> None:
     sn.add_argument("--force", action="store_true", help="même si un cycle est en cours")
     ca = sub.add_parser("close-all", help="ferme toutes les positions des deux wallets")
     ca.add_argument("--force", action="store_true", help="même si le bot semble tourner")
+    cc = sub.add_parser("close-cycle", help="ferme le cycle en cours (bilan compris) puis s'arrête")
+    cc.add_argument("--force", action="store_true", help="même si le bot semble tourner")
     rs = sub.add_parser("resume", help="lève la pause")
     rs.add_argument("--reset-costs", action="store_true", help="oublie l'historique de coût (plafond)")
     args = ap.parse_args(argv)
@@ -361,7 +428,8 @@ def main(argv=None) -> None:
     settings = load_settings(args.env, need_keys=args.cmd != "sim")
     setup_logging(settings.state_dir, args.verbose)
     {"probe": cmd_probe, "status": cmd_status, "plan": cmd_plan, "register": cmd_register, "run": cmd_run,
-     "sim": cmd_sim, "stake-now": cmd_stake_now, "close-all": cmd_close_all, "resume": cmd_resume}[args.cmd](settings, args)
+     "sim": cmd_sim, "stake-now": cmd_stake_now, "close-all": cmd_close_all, "close-cycle": cmd_close_cycle,
+     "resume": cmd_resume}[args.cmd](settings, args)
 
 
 if __name__ == "__main__":

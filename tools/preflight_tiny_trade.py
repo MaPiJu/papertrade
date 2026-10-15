@@ -170,10 +170,78 @@ def run(venue, w, really, log, state_file=None):
     return out, verdict
 
 
+def run_straddle(venue, w, really, log, state_file=None):
+    """One-wallet mode check: a long and a short of 10$ each on the same wallet must coexist as
+    two positions (no netting), be read with the right sides, and close independently."""
+    out = {"wallet": w, "mode": "straddle", "steps": []}
+    verdict = []
+
+    def check(ok, what):
+        verdict.append(("PASS" if ok else "FAIL", what))
+        log(f"{'PASS' if ok else 'FAIL'} {what}")
+
+    if state_file and state_file.exists():
+        st = json.loads(state_file.read_text())
+        if st.get("phase", "idle") != "idle" or st.get("cycle") or st.get("rebalance"):
+            raise SystemExit("data/state.json shows a cycle/rebalance in progress: finish it, stop the bot first")
+        if time.time() - state_file.stat().st_mtime < 30:
+            raise SystemExit("data/state.json was written <30 s ago: the bot seems to be running. Create STOP first")
+    before = venue.positions(w)
+    free0 = venue.usdc(w)
+    log(f"initial: free {free0:.2f}$, positions {[p.id for p in before]}")
+    if before:
+        raise SystemExit(f"positions already listed on {w}: {[p.id for p in before]} - close them on the site first")
+    if not venue.keys_ready():
+        raise SystemExit("no valid session key: run `python -m ptbot register` and wait ~5 minutes first")
+    if free0 < 2 * MARGIN + 0.5:
+        raise SystemExit(f"free balance {free0:.2f}$ < {2 * MARGIN + 0.5}$")
+    if not really:
+        log("dry run OK. Re-run with --i-understand-this-trades to trade.")
+        return out, verdict
+    leverage = tiny_leverage(venue.minimums()[1])
+    t0 = time.time()
+    for is_long in (True, False):
+        try:
+            venue.open(w, "BTC", is_long, MARGIN, leverage, 120)
+        except Exception as e:
+            check(False, f"{'long' if is_long else 'short'} accepted ({e})")
+            log("Close whatever is open on the website now.")
+            return out, verdict
+    check(True, "relayer accepted a long and a short on the same wallet")
+    legs = {}
+    while time.time() - t0 < 150 and len(legs) < 2:
+        time.sleep(1)
+        listed = read_positions(venue, w, log) or []
+        legs = {p.is_long: p for p in listed if p.is_long is not None}
+    out["steps"].append({"step": "both open", "positions": [p.__dict__ for p in legs.values()],
+                         "latency_s": round(time.time() - t0, 1), "free": venue.usdc(w)})
+    check(len(legs) == 2 and legs[True].id != legs[False].id,
+          f"long and short coexist as two positions on one wallet (seen: {[(p.id, p.is_long) for p in legs.values()]})")
+    if len(legs) < 2:
+        log("Not both visible: if the site shows a netted single position (or none), one-wallet mode cannot work. "
+            "Close everything on the website now.")
+        for p in legs.values():
+            venue.close(w, [p.id])
+        return out, verdict
+    for p in legs.values():
+        venue.close(w, [p.id])
+    gone, t_close = 0, time.time()
+    while time.time() - t_close < 180 and gone < 3:
+        time.sleep(2)
+        listed = read_positions(venue, w, log)
+        if listed is None:
+            continue
+        gone = gone + 1 if not {p.id for p in legs.values()} & {p.id for p in listed} else 0
+    check(gone >= 3, "both closed independently")
+    out["steps"].append({"step": "closed", "free": venue.usdc(w)})
+    return out, verdict
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser()
     ap.add_argument("--wallet", choices=("A", "B"), default="A")
     ap.add_argument("--i-understand-this-trades", action="store_true")
+    ap.add_argument("--straddle", action="store_true", help="long + short on the same wallet (ONE_WALLET mode)")
     ap.add_argument("--env", default=".env")
     a = ap.parse_args(argv)
     sys.path.insert(0, str(Path.cwd()))
@@ -183,11 +251,11 @@ def main(argv=None):
     venue = build_live(settings)
     print(f"domains used: {json.dumps(venue.domains)}")
     state_file, really = settings.state_dir / "state.json", a.i_understand_this_trades
-    out, verdict = run(venue, a.wallet, really, print, state_file)
+    out, verdict = (run_straddle if a.straddle else run)(venue, a.wallet, really, print, state_file)
     out["verdict"] = verdict
     if not really:
         return
-    path = settings.state_dir / "preflight" / f"tiny_trade_{a.wallet}.json"
+    path = settings.state_dir / "preflight" / f"{'straddle' if a.straddle else 'tiny_trade'}_{a.wallet}.json"
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(out, indent=1, default=str))
     print("\n".join(f"{v:4} {w}" for v, w in verdict))

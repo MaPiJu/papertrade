@@ -32,13 +32,20 @@ class Params:
     stake_threshold: float = 1000.0    # stake as soon as a wallet holds this much unstaked PAPER
     max_cost_per_1000: float = 7.0     # USD per 1,000 PAPER above which farming stops
     cost_window: int = 1               # cycles averaged for the cost cap (1 = rusk0f's per-cycle rule)
+    strategy: str = "ladder"           # "ladder" (re-arm the losing leg) or "pair" (close both together)
+    ladder_step: float = 0.0025        # ladder: the losing leg is closed and re-opened after this move
+    ladder_reset: float = 0.0          # ladder: winner's gain that ends the period (0 = from emission and cap)
+    ladder_cost_margin: float = 0.02   # ladder auto reset: aim this far under the cost cap
+    ladder_max_leverage: int = 1000    # ladder legs: leverage set by the step (LEVERAGE is for "pair")
+    one_wallet: bool = False           # both legs on wallet A (no transfers between A and B)
 
 
 @dataclass
 class OpenPlan:
     margin: float
     leverage: int
-    close_move: float
+    close_move: float          # pair: exit of both legs; ladder: step of the losing leg
+    reset: float = 0.0         # ladder: winner's gain that ends the period
 
     @property
     def notional(self) -> float:
@@ -48,6 +55,7 @@ class OpenPlan:
 @dataclass
 class Skip:
     reason: str
+    capital: bool = False   # only the capital is short (another plan may still fit)
 
 
 @dataclass
@@ -55,6 +63,32 @@ class Transfer:
     src: str
     dst: str
     amount: float
+
+
+# Settlement of a close, checked to the cent against real trades (14/10/2026): the loser loses
+# notional x move, PAPER is minted on 98% of that loss; the winner's gain goes through the
+# "asymmetric impact" of the docs (BTC/ETH launch parameters) and then pays a 2% fee.
+DEADBAND = 0.00002
+WIN_FEE = 0.02
+MINT_FACTOR = 0.98
+IMPACT = {"BTC": (0.10, 15000.0, 100_000.0, 814.598), "ETH": (0.10, 15000.0, 100_000.0, 483.979)}
+
+
+def win_payout(move: float, coin: str = "BTC") -> float:
+    """$ received per $ of notional when a winning position is closed after `move`."""
+    base, rate_mult, ref_notional, pos_mult = IMPACT.get(coin, IMPACT["BTC"])
+    m = move - DEADBAND
+    if m <= 0:
+        return 0.0
+    scale = (1 - base) / (1 + 1 / (m * rate_mult) + ref_notional / (1e6 * m * pos_mult))
+    return m * scale * (1 - WIN_FEE)
+
+
+def cost_per_1000_at(move: float, emission: float, coin: str = "BTC") -> float:
+    """$ per 1000 PAPER when the loser loses `move` and the winner is realised at `move`."""
+    if move <= 0 or emission <= 0:
+        return math.inf
+    return (move - win_payout(move, coin)) / (move * MINT_FACTOR * emission) * 1000
 
 
 def liq_distance(leverage: int) -> float:
@@ -91,6 +125,64 @@ def plan_open(bal_a: float, bal_b: float, min_margin: float, min_notional: float
     if move <= 0:
         return Skip(f"x{leverage}: liquidation trop proche ({liq_distance(leverage):.3%}) pour LIQ_SAFETY")
     return OpenPlan(margin=margin, leverage=leverage, close_move=move)
+
+
+MAX_LADDER_RESET = 0.06
+
+
+def ladder_reset_move(emission: float | None, p: Params) -> float | None:
+    """Winner's gain that ends a ladder period: fixed, or the smallest move whose cost per 1000
+    PAPER stays under the cap with a margin (the cost falls as the realised move grows)."""
+    if p.ladder_reset > 0:
+        return p.ladder_reset
+    if not emission or emission <= 0:
+        return None
+    target = p.max_cost_per_1000 * (1 - p.ladder_cost_margin)
+    move = max(4 * p.ladder_step, 0.005)
+    while move <= MAX_LADDER_RESET + 1e-12:
+        if cost_per_1000_at(move, emission, p.coin) <= target:
+            return round(move, 6)
+        move += 0.0005
+    return None
+
+
+def plan_ladder(free: dict[str, float], min_margin: float, min_notional: float, emission: float | None,
+                p: Params) -> OpenPlan | Skip:
+    """Ladder sizing. Each leg is closed after `ladder_step` against it and re-opened at once, so
+    the losing side pays up to (reset + step) x notional during a period: the notional is sized so
+    that it always can (in two-wallet mode each wallet must carry a one-sided period on its own; in
+    one-wallet mode wallet A carries both legs)."""
+    reset = ladder_reset_move(emission, p)
+    if reset is None:
+        what = f"émission {emission:.1f} PAPER/$" if emission else "émission illisible"
+        return Skip(f"{what}: même en laissant le gagnant courir jusqu'à {MAX_LADDER_RESET:.0%}, le coût "
+                    f"dépasserait {p.max_cost_per_1000:.2f}$/1000 PAPER")
+    step = p.ladder_step
+    max_lev = min(p.ladder_max_leverage, int(1 / (step + LIQ_BUFFER + p.liq_safety)))
+    if max_lev < 1:
+        return Skip(f"pas de {step:.2%}: liquidation trop proche pour LIQ_SAFETY")
+    # Margins locked at once: each leg, plus a re-armed leg's new one before its old one comes back.
+    legs_on_pool = 3 if p.one_wallet else 2
+    pool = (free.get("A", 0.0) if p.one_wallet else min(free.values())) * p.margin_fraction
+    span = reset + step
+    # A re-opened leg keeps the other leg's BTC quantity, so its margin shrinks with the price by up
+    # to `span` during a period: start far enough above the protocol's minimums.
+    floor_margin = math.ceil(min_margin / (1 - span) * 100) / 100
+    floor_notional = min_notional / (1 - span)
+    leverage = max_lev
+    margin = pool / (legs_on_pool + span * leverage)
+    if p.max_margin_usd > 0:
+        margin = min(margin, p.max_margin_usd)
+    if margin < floor_margin:
+        # Not enough capital at this leverage: keep the minimum margin and lower the leverage.
+        margin = floor_margin
+        leverage = int((pool / floor_margin - legs_on_pool) / span)
+    margin = max(floor_cents(margin), floor_margin)
+    if leverage < 1 or margin * leverage < floor_notional:
+        return Skip(f"capital trop faible pour l'échelle: {pool:.2f}$ disponibles pour couvrir "
+                    f"{span:.2%} de pertes d'un côté (minimums {min_margin:.0f}$ de marge, {min_notional:,.0f}$ "
+                    "de notionnel)", capital=True)
+    return OpenPlan(margin=margin, leverage=leverage, close_move=step, reset=reset)
 
 
 # PaperTrade withdrawals and deposits through HyperCore need 10 USDC, and a wallet's first

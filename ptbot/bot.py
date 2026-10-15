@@ -1,6 +1,12 @@
 """Delta-neutral state machine: idle -> opening -> open -> closing -> idle,
 with a `rebalancing` detour when the two USDC balances drift apart.
 
+Two strategies share it. "pair": both legs are closed together once the price has moved
+`close_move`. "ladder": the losing leg is closed after `close_move` (minting PAPER) and
+re-opened at once (`rearming`), while the winning leg keeps running; the period ends when a
+leg's gain reaches `reset`, so the profit, which carries the haircut, is realised on a large
+move, at a low cost per PAPER, while PAPER is minted in small steps.
+
 Safety rules the code below relies on:
   - an order whose submit failed ambiguously (timeout, 5xx, lost response) may
     still execute until its signed deadline: the bot keeps watching for it,
@@ -16,6 +22,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import signal
 import threading
@@ -25,13 +32,14 @@ from pathlib import Path
 from .constants import SCALE, STAKE_DEADLINE_S, WITHDRAW_DEADLINE_S
 from .papertrade_api import IntentRejected
 from .positions import Position, plausible_price
-from .strategy import (MIN_DEPOSIT_USD, Params, Skip, cost_cap_hit, cost_per_1000, floor_cents, liq_distance,
-                       plan_open, plan_rebalance)
+from .strategy import (MIN_CORE_TRANSFER_USD, MIN_DEPOSIT_USD, Params, Skip, Transfer, cost_cap_hit, cost_per_1000,
+                       floor_cents, liq_distance, plan_ladder, plan_open, plan_rebalance)
 
 log = logging.getLogger("ptbot")
 
-WALLETS = ("A", "B")
-IS_LONG = {"A": True, "B": False}   # A carries the long leg, B the short leg
+WALLETS = ("A", "B")                # the two wallets of .env
+LEGS = ("A", "B")                   # leg A is the long, leg B the short: on wallets A and B, or both on A
+IS_LONG = {"A": True, "B": False}
 # Leg statuses whose order may still execute ('pending' = state saved before the request, then a crash).
 MAYBE_EXECUTED = ("sent", "unknown", "pending")
 SCHEMA = 3
@@ -66,6 +74,8 @@ class Timing:
     rebalance_warn_s: float = 900.0
     rebalance_give_up_s: float = 7200.0
     heartbeat_s: float = 60.0
+    rearm_attempts: int = 3          # ladder: re-opens of a leg before ending the period
+    rearm_retry_s: float = 8.0
 
 
 def fresh_state() -> dict:
@@ -140,13 +150,15 @@ class Bot:
             self.st.setdefault(key, default)
 
     # --- main loop -------------------------------------------------------
-    def run(self, max_steps: int | None = None, stop_file: Path | None = None) -> None:
+    def run(self, max_steps: int | None = None, stop_file: Path | None = None, stop_when_idle: bool = False) -> None:
         restore = self._catch_signals()
         steps = errors = 0
         try:
             while (max_steps is None or steps < max_steps) and not self._stop:
                 if stop_file and stop_file.exists():
                     log.warning("Fichier %s présent: arrêt du bot", stop_file)
+                    return
+                if stop_when_idle and self.st["phase"] == "idle":
                     return
                 try:
                     self.step()
@@ -156,7 +168,7 @@ class Bot:
                     self.store.save()
                     log.exception("Erreur pendant le cycle (nouvel essai au prochain tour)")
                     # back off while an API is down, but keep watching the price while positions may be open
-                    exposed = self.st["phase"] in ("opening", "open", "closing")
+                    exposed = self.st["phase"] in ("opening", "open", "closing", "rearming")
                     self.v.sleep(min(2 * errors, 6) if exposed else min(5 * errors, 60))
                 self.v.sleep(self.t.poll_s)
                 steps += 1
@@ -183,8 +195,8 @@ class Bot:
         if resume_file and resume_file.exists():
             self.resume(reset_costs="reset-costs" in resume_file.read_text())
             resume_file.unlink()
-        handler = {"idle": self._idle, "opening": self._opening, "open": self._open,
-                   "closing": self._closing, "rebalancing": self._rebalancing}[self.st["phase"]]
+        handler = {"idle": self._idle, "opening": self._opening, "open": self._open, "closing": self._closing,
+                   "rearming": self._rearming, "rebalancing": self._rebalancing}[self.st["phase"]]
         handler(self.v.now())
         self.store.save()
 
@@ -221,6 +233,25 @@ class Bot:
         if pid not in known:
             known.append(pid)
             del known[:-500]
+
+    def _wallet(self, leg: str) -> str:
+        """Wallet carrying a leg of the current cycle (cycles of older versions: leg = wallet)."""
+        c = self.st.get("cycle") or {}
+        return c.get("wallets", {}).get(leg, leg)
+
+    def _cycle_wallets(self) -> list[str]:
+        return sorted({self._wallet(leg) for leg in LEGS})
+
+    def _keep(self, w: str) -> set:
+        """Positions of wallet `w` that belong to the cycle (both legs when they share it)."""
+        c = self.st.get("cycle")
+        if not c:
+            return set()
+        keep = {c["legs"][leg]["pos_id"] for leg in LEGS if self._wallet(leg) == w}
+        r = c.get("rearm")
+        if r and r.get("old_id") is not None and self._wallet(r["leg"]) == w:
+            keep.add(r["old_id"])
+        return keep - {None}
 
     def _sweep(self, w: str, listed: dict, keep: set, now: float) -> None:
         """Closes every listed position of `w` that is not in `keep`, and forgets a
@@ -284,7 +315,12 @@ class Bot:
             return
         bal = {w: self.v.usdc(w) for w in WALLETS}
         mins = self.v.minimums()
-        transfer = plan_rebalance(bal["A"], bal["B"], self.p, mins)
+        if self.p.one_wallet:
+            # Everything trades from wallet A: bring B's USDC over (a transfer needs 11 USDC).
+            amount = float(math.floor(bal["B"]))
+            transfer = Transfer("B", "A", amount) if amount >= MIN_CORE_TRANSFER_USD and not listed["B"] else None
+        else:
+            transfer = plan_rebalance(bal["A"], bal["B"], self.p, mins)
         if transfer:
             log.info("Soldes déséquilibrés (A=%.2f$, B=%.2f$): transfert de %.2f$ de %s vers %s",
                      bal["A"], bal["B"], transfer.amount, transfer.src, transfer.dst)
@@ -293,7 +329,13 @@ class Bot:
                                     "withdraw_attempts": 0, "send_attempts": 0}
             self.st["phase"] = "rebalancing"
             return
-        plan = plan_open(bal["A"], bal["B"], *mins, self.p)
+        plan = plan_ladder(bal, *mins, self.v.paper_emission(), self.p) if self.p.strategy == "ladder" else None
+        if isinstance(plan, Skip) and plan.capital:
+            self._say_once(f"{plan.reason}: paire classique à la place")
+            plan = None
+        if plan is None:
+            pair_bal = (bal["A"] / 2, bal["A"] / 2) if self.p.one_wallet else (bal["A"], bal["B"])
+            plan = plan_open(*pair_bal, *mins, self.p)
         if isinstance(plan, Skip):
             self._say_once(f"Pas de cycle: {plan.reason}")
             return
@@ -317,30 +359,46 @@ class Bot:
             "margin": plan.margin, "leverage": plan.leverage, "close_move": plan.close_move,
             "mid_at_open": mid, "mid_hi": mid, "mid_lo": mid, "aborted": False, "failure_counted": False,
             "free_start": sum(bal.values()), "equity_start": equity, "paper_start": paper,
-            "legs": {w: {"status": "pending", "intent": None, "pos_id": None, "entry": None, "miss": 0,
-                         "gone_reads": 0, "close_sends": 0} for w in WALLETS},
+            "legs": {leg: {"status": "pending", "intent": None, "pos_id": None, "entry": None, "miss": 0,
+                           "gone_reads": 0, "close_sends": 0} for leg in LEGS},
             "next_poll": 0, "close_sent_at": None, "settle_at": None,
+            "mode": "ladder" if plan.reset else "pair", "reset": plan.reset, "rearms": 0, "rearm": None,
+            "min_margin": self.v.minimums()[0],
+            "wallets": {leg: "A" if self.p.one_wallet else leg for leg in LEGS},
         }
-        log.info("Cycle #%d: long %s sur A + short %s sur B, marge %.2f$ x%d (notionnel %s$), "
-                 "fermeture à ±%.2f%% (liquidation à ±%.2f%%), %s=%.2f",
-                 cycle["n"], coin, coin, plan.margin, plan.leverage, f"{plan.notional:,.0f}",
-                 plan.close_move * 100, liq_distance(plan.leverage) * 100, coin, mid)
+        where = "sur A" if self.p.one_wallet else "sur A et B"
+        if plan.reset:
+            log.info("Cycle #%d (échelle): long + short %s %s, marge %.2f$ x%d (notionnel %s$), jambe perdante "
+                     "réarmée tous les %.2f%%, gagnant encaissé à +%.2f%% (liquidation à ±%.2f%%), %s=%.2f",
+                     cycle["n"], coin, where, plan.margin, plan.leverage, f"{plan.notional:,.0f}",
+                     plan.close_move * 100, plan.reset * 100, liq_distance(plan.leverage) * 100, coin, mid)
+        else:
+            log.info("Cycle #%d: long + short %s %s, marge %.2f$ x%d (notionnel %s$), "
+                     "fermeture à ±%.2f%% (liquidation à ±%.2f%%), %s=%.2f",
+                     cycle["n"], coin, where, plan.margin, plan.leverage, f"{plan.notional:,.0f}",
+                     plan.close_move * 100, liq_distance(plan.leverage) * 100, coin, mid)
         self.st["cycle"] = cycle
         self.st["phase"] = "opening"
         self.st["intents_valid_until"] = cycle["deadline"] + self.t.indexer_slack_s
         self.store.save()  # write-ahead: a crash during the requests below resumes in 'opening'
-        for w in WALLETS:
-            leg = cycle["legs"][w]
+        # After an open-interest refusal, start with the other side: it lowers the net open interest.
+        order = ("B", "A") if self.st.get("open_first") == "B" else LEGS
+        for name in order:
+            leg = cycle["legs"][name]
             try:
-                leg["intent"] = self.v.open(w, coin, IS_LONG[w], plan.margin, plan.leverage, self.t.open_deadline_s)
+                leg["intent"] = self.v.open(self._wallet(name), coin, IS_LONG[name], plan.margin, plan.leverage,
+                                            self.t.open_deadline_s)
                 leg["status"] = "sent"
             except IntentRejected as e:
                 leg["status"] = "rejected"
-                log.error("Ouverture refusée sur %s: %s", w, e)
+                log.error("Ouverture refusée sur %s: %s", name, e)
+                if "openInterest" in str(e):
+                    self.st["open_first"] = "B" if name == "A" else "A"
                 break  # no point opening the other leg alone
             except Exception as e:
                 leg["status"] = "unknown"
-                log.warning("Ouverture sur %s: pas de réponse claire (%s). L'ordre a peut-être été exécuté, je surveille", w, e)
+                log.warning("Ouverture sur %s: pas de réponse claire (%s). L'ordre a peut-être été exécuté, je surveille",
+                            name, e)
         for leg in cycle["legs"].values():
             if leg["status"] == "pending":
                 leg["status"] = "not_sent"
@@ -365,33 +423,53 @@ class Bot:
         entry = self.st["cycle"]["legs"][w]["entry"]
         return 1 - mid / entry if IS_LONG[w] else mid / entry - 1
 
-    def _sync_legs(self, w: str, listed: dict, mid: float, now: float) -> None:
-        """Adopts a new position as the wallet's leg if its order may have executed,
-        and closes everything else that is not a leg."""
+    def _sync_legs(self, leg: str, listed: dict, mid: float, now: float) -> None:
+        """Adopts a new position of the leg's wallet as the leg if its order may have executed.
+        The callers then sweep each wallet: whatever is not a leg gets closed."""
         c = self.st["cycle"]
-        leg = c["legs"][w]
-        if leg["pos_id"] is None and leg["status"] in MAYBE_EXECUTED and now < self.st["intents_valid_until"]:
+        d = c["legs"][leg]
+        w = self._wallet(leg)
+        taken = {c["legs"][other]["pos_id"] for other in LEGS if other != leg}
+        if d["pos_id"] is None and d["status"] in MAYBE_EXECUTED and now < self.st["intents_valid_until"]:
             for p in listed.values():
-                if p.id in self._known(w) or p.coin not in (None, c["coin"]) or p.is_long not in (None, IS_LONG[w]):
+                if (p.id in self._known(w) or p.id in taken or p.coin not in (None, c["coin"])
+                        or p.is_long not in (None, IS_LONG[leg])):
                     continue
                 # Not this cycle's order (e.g. a late fill of an earlier one): swept below. Values far
                 # off (a unit the parser misreads) are ignored rather than closing the bot's own leg.
-                ratio = p.margin / c["margin"] if p.margin else 1.0
+                ratio = p.margin / d.get("margin", c["margin"]) if p.margin else 1.0
                 wrong_margin = 0.5 <= ratio <= 2 and abs(ratio - 1) > 0.02
                 wrong_leverage = p.leverage is not None and 1 <= p.leverage <= 1000 and p.leverage != c["leverage"]
                 if wrong_margin or wrong_leverage:
                     continue
                 self._remember(w, p.id)
-                leg["pos_id"] = p.id
+                d["pos_id"] = p.id
                 # Unknown entry: assume the worst price seen since the order was sent.
-                worst = c["mid_hi"] if IS_LONG[w] else c["mid_lo"]
-                leg["entry"] = plausible_price(p.entry, mid) or worst
-                log.info("Wallet %s: position #%d ouverte (entrée %.2f)", w, p.id, leg["entry"])
+                worst = c["mid_hi"] if IS_LONG[leg] else c["mid_lo"]
+                d["entry"] = plausible_price(p.entry, mid) or worst
+                log.info("Wallet %s: position #%d ouverte (%s, entrée %.2f)", w, p.id,
+                         "long" if IS_LONG[leg] else "short", d["entry"])
                 if self.st["phase"] == "closing":   # late fill after an abort: close it with the cycle
                     log.warning("Wallet %s: exécution tardive, je la ferme", w)
-                    self._send_close(now, [w], reset_timer=False)
+                    self._send_close(now, [leg], reset_timer=False)
                 break
-        self._sweep(w, listed, {leg["pos_id"]} - {None}, now)
+
+    def _read_cycle_wallets(self) -> dict[str, dict]:
+        """Positions of every wallet of the cycle; a wallet whose read fails is left out."""
+        listed = {}
+        for w in self._cycle_wallets():
+            try:
+                listed[w] = self._read(w)
+            except Exception as e:
+                log.warning("Positions de %s illisibles (%s), nouvel essai", w, e)
+        return listed
+
+    def _sync_and_sweep(self, listed: dict, mid: float, now: float) -> None:
+        for leg in LEGS:
+            if self._wallet(leg) in listed:
+                self._sync_legs(leg, listed[self._wallet(leg)], mid, now)
+        for w, positions in listed.items():
+            self._sweep(w, positions, self._keep(w), now)
 
     def _opening(self, now: float) -> None:
         c = self.st["cycle"]
@@ -400,30 +478,28 @@ class Bot:
         c["next_poll"] = now + self.t.fast_poll_s
         mid = self.v.mid(c["coin"])
         c["mid_hi"], c["mid_lo"] = max(c["mid_hi"], mid), min(c["mid_lo"], mid)
-        found = [w for w in WALLETS if c["legs"][w]["pos_id"] is not None]
-        for w in found:  # a lone leg is naked: never let it run past its exit (needs only the price)
-            if len(found) < len(WALLETS) and self._adverse(w, mid) >= c["close_move"]:
-                log.warning("Jambe %s seule et déjà à %.2f%% de perte: je la ferme", w, self._adverse(w, mid) * 100)
+        found = [leg for leg in LEGS if c["legs"][leg]["pos_id"] is not None]
+        for leg in found:  # a lone leg is naked: never let it run past its exit (needs only the price)
+            if len(found) < len(LEGS) and self._adverse(leg, mid) >= c["close_move"]:
+                log.warning("Jambe %s seule et déjà à %.2f%% de perte: je la ferme", leg, self._adverse(leg, mid) * 100)
                 self._abort(now, found)
                 return
-        for w in WALLETS:
-            try:
-                listed = self._read(w)
-            except Exception as e:
-                log.warning("Positions de %s illisibles (%s), nouvel essai", w, e)
-                continue
-            self._sync_legs(w, listed, mid, now)
-        found = [w for w in WALLETS if c["legs"][w]["pos_id"] is not None]
-        if len(found) == len(WALLETS):
+        self._sync_and_sweep(self._read_cycle_wallets(), mid, now)
+        found = [leg for leg in LEGS if c["legs"][leg]["pos_id"] is not None]
+        if len(found) == len(LEGS):
             self.st["open_failures"] = 0
             c["next_poll"] = now + self.t.positions_every_s
             c["heartbeat"] = now
             self.st["phase"] = "open"
             ea, eb = c["legs"]["A"]["entry"], c["legs"]["B"]["entry"]
-            log.info("Paire ouverte (A %.2f, B %.2f): fermeture sous %.2f ou au-dessus de %.2f",
-                     ea, eb, ea * (1 - c["close_move"]), eb * (1 + c["close_move"]))
+            if c.get("mode") == "ladder":
+                log.info("Paire ouverte (long %.2f, short %.2f): une jambe est réarmée dès %.2f%% de perte, la "
+                         "période se termine quand l'autre gagne %.2f%%", ea, eb, c["close_move"] * 100, c["reset"] * 100)
+            else:
+                log.info("Paire ouverte (A %.2f, B %.2f): fermeture sous %.2f ou au-dessus de %.2f",
+                         ea, eb, ea * (1 - c["close_move"]), eb * (1 + c["close_move"]))
             return
-        waiting = [w for w in WALLETS if c["legs"][w]["pos_id"] is None and c["legs"][w]["status"] in MAYBE_EXECUTED]
+        waiting = [leg for leg in LEGS if c["legs"][leg]["pos_id"] is None and c["legs"][leg]["status"] in MAYBE_EXECUTED]
         if waiting and now < self.st["intents_valid_until"]:
             return
         if found:
@@ -459,13 +535,14 @@ class Bot:
         """Best effort: kill the orders of legs not seen yet. The bot keeps watching for them
         until they expire anyway, in case the cancellation does not go through."""
         cancel = getattr(self.v, "cancel", None)
-        for w in WALLETS:
-            leg = c["legs"][w]
+        for name in LEGS:
+            leg = c["legs"][name]
             if not cancel or leg["pos_id"] is not None or leg["status"] not in MAYBE_EXECUTED or not leg["intent"]:
                 continue
-            if leg.get("cancel_sent"):
+            if leg.get("cancel_sent") == leg["intent"]:
                 continue
-            leg["cancel_sent"] = True
+            leg["cancel_sent"] = leg["intent"]
+            w = self._wallet(name)
             try:
                 cancel(w, leg["intent"])
                 log.info("Wallet %s: ordre %s annulé", w, leg["intent"])
@@ -473,55 +550,225 @@ class Bot:
                 log.warning("Wallet %s: annulation de l'ordre %s impossible (%s), je surveille jusqu'à son échéance",
                             w, leg["intent"], e)
 
-    # --- open: watch the price, close both legs before liquidation --------
+    # --- open: watch the price, close (or re-arm) legs before liquidation ----
     def _open(self, now: float) -> None:
         c = self.st["cycle"]
         mid = self.v.mid(c["coin"])
-        worst = max(self._adverse(w, mid) for w in WALLETS)
-        if worst >= c["close_move"] - 1e-12:
+        worst = max(self._adverse(leg, mid) for leg in LEGS)
+        if c.get("mode") == "ladder":
+            if self._ladder_check(now, mid):
+                return
+        elif worst >= c["close_move"] - 1e-12:
             log.info("%s=%.2f: une jambe perd %.3f%%, fermeture des deux jambes", c["coin"], mid, worst * 100)
-            self._send_close(now, list(WALLETS))
+            self._send_close(now, list(LEGS))
             self.st["phase"] = "closing"
             return
         if now >= c["next_poll"]:
-            # One wallet per poll, so a slow read never delays the price check above for long.
-            w = WALLETS[c.get("read_turn", 0) % len(WALLETS)]
-            c["next_poll"] = now + self.t.positions_every_s / len(WALLETS)
+            # One leg per poll, so a slow read never delays the price check above for long.
+            leg = LEGS[c.get("read_turn", 0) % len(LEGS)]
+            w = self._wallet(leg)
+            c["next_poll"] = now + self.t.positions_every_s / len(LEGS)
             try:
                 listed = self._read(w)
             except Exception as e:
                 log.warning("Positions de %s illisibles (%s): je continue de surveiller le prix", w, e)
                 return
-            self._sweep(w, listed, {c["legs"][w]["pos_id"]}, now)
-            leg = c["legs"][w]
-            if leg["pos_id"] in listed:
-                leg["miss"] = 0
+            self._sweep(w, listed, self._keep(w), now)
+            d = c["legs"][leg]
+            if d["pos_id"] in listed:
+                d["miss"] = 0
                 c["read_turn"] = c.get("read_turn", 0) + 1
             else:
-                leg["miss"] += 1
-                if leg["miss"] >= self.t.missing_reads or self._adverse(w, mid) >= liq_distance(c["leverage"]):
-                    log.warning("Jambe %s disparue (liquidée ou fermée à la main): je ferme la paire", w)
-                    self._send_close(now, list(WALLETS))  # both: if the "missing" one still exists, close it too
+                d["miss"] += 1
+                if d["miss"] >= self.t.missing_reads or self._adverse(leg, mid) >= liq_distance(c["leverage"]):
+                    log.warning("Jambe %s disparue (liquidée ou fermée à la main): je ferme la paire", leg)
+                    self._send_close(now, list(LEGS))  # both: if the "missing" one still exists, close it too
                     self.st["phase"] = "closing"
                     return
-                c["next_poll"] = now + self.t.fast_poll_s  # one miss may be a glitch: re-check this wallet quickly
+                c["next_poll"] = now + self.t.fast_poll_s  # one miss may be a glitch: re-check this leg quickly
         if now - c.get("heartbeat", 0) >= self.t.heartbeat_s:
             c["heartbeat"] = now
-            log.info("Paire ouverte: %s=%.2f, jambe la plus en perte %.3f%% (fermeture à %.2f%%)",
-                     c["coin"], mid, worst * 100, c["close_move"] * 100)
+            if c.get("mode") == "ladder":
+                log.info("Échelle: %s=%.2f, long %+.3f%%, short %+.3f%% (réarmement à -%.2f%%, encaissement à "
+                         "+%.2f%%), %d réarmement(s)", c["coin"], mid, -self._adverse("A", mid) * 100,
+                         -self._adverse("B", mid) * 100, c["close_move"] * 100, c["reset"] * 100, c.get("rearms", 0))
+            else:
+                log.info("Paire ouverte: %s=%.2f, jambe la plus en perte %.3f%% (fermeture à %.2f%%)",
+                         c["coin"], mid, worst * 100, c["close_move"] * 100)
 
-    def _send_close(self, now: float, wallets: list[str], reset_timer: bool = True) -> None:
+    # --- ladder: re-arm the losing leg, realise the winner on a large move ----
+    def _ladder_check(self, now: float, mid: float) -> bool:
+        """Ends the period or starts re-arming a leg; True when the phase changed."""
         c = self.st["cycle"]
-        for w in wallets:
-            leg = c["legs"][w]
+        gains = {leg: -self._adverse(leg, mid) for leg in LEGS}
+        winner = max(LEGS, key=lambda leg: gains[leg])
+        if gains[winner] >= c["reset"] - 1e-12:
+            log.info("%s=%.2f: jambe %s à +%.3f%%, j'encaisse (fermeture des deux jambes, %d réarmement(s))",
+                     c["coin"], mid, winner, gains[winner] * 100, c.get("rearms", 0))
+            self._send_close(now, list(LEGS))
+            self.st["phase"] = "closing"
+            return True
+        loser = min(LEGS, key=lambda leg: gains[leg])
+        if -gains[loser] >= c["close_move"] - 1e-12:
+            self._start_rearm(now, loser, mid)
+            return True
+        return False
+
+    def _start_rearm(self, now: float, leg: str, mid: float) -> None:
+        """Closes the losing leg and re-opens it at once: both orders go out back to back, so the
+        pair stays hedged (a close-then-open would leave the other leg alone for ~20 s)."""
+        c = self.st["cycle"]
+        d = c["legs"][leg]
+        w = self._wallet(leg)
+        try:
+            free = self.v.usdc(w)
+        except Exception as e:
+            log.warning("Solde de %s illisible (%s): réarmement au prochain tour", w, e)
+            return
+        margin = self._rearm_margin(leg, mid)
+        if free < margin + 0.05:   # the new leg locks its margin before the old one gives its back
+            log.info("Wallet %s: %.2f$ libres, trop peu pour réarmer la jambe %s: fin de la période", w, free, leg)
+            self._send_close(now, list(LEGS))
+            self.st["phase"] = "closing"
+            return
+        notional = d.get("margin", c["margin"]) * c["leverage"]
+        loss = self._adverse(leg, mid) * notional
+        c["rearm"] = {"leg": leg, "old_id": d["pos_id"], "old_entry": d["entry"], "started": now, "gone_reads": 0,
+                      "close_sends": 0, "close_sent_at": now, "attempts": 0, "retry_at": 0.0}
+        d.update(status="not_sent", intent=None, pos_id=None, entry=None, miss=0, gone_reads=0, close_sends=0)
+        d.pop("first_close_at", None)
+        self.st["phase"] = "rearming"
+        c["next_poll"] = now + self.t.fast_poll_s
+        log.info("%s=%.2f: jambe %s à -%.3f%%, je la ferme (~%.2f$ de perte, PAPER mintés) et la rouvre",
+                 c["coin"], mid, leg, loss / notional * 100, loss)
+        self.store.save()  # write-ahead: a crash resumes in 'rearming' with the close to confirm
+        self._rearm_close(now)
+        self._rearm_open(now, mid)
+
+    def _rearm_margin(self, leg: str, mid: float) -> float:
+        """Margin of a re-opened leg: the same BTC quantity as the other leg (same dollar notional
+        at another price would leave the pair slightly long or short, a cost that depends on the
+        trend's direction), never under the protocol's minimum margin."""
+        c = self.st["cycle"]
+        other = c["legs"]["B" if leg == "A" else "A"]
+        margin = other.get("margin", c["margin"]) * mid / other["entry"] if other.get("entry") else c["margin"]
+        return max(floor_cents(margin), c.get("min_margin", 0.0))
+
+    def _rearm_close(self, now: float) -> None:
+        c = self.st["cycle"]
+        r = c["rearm"]
+        r["close_sends"] += 1
+        r["close_sent_at"] = now
+        try:
+            self.v.close(self._wallet(r["leg"]), [r["old_id"]])
+        except Exception as e:
+            log.error("Fermeture #%s (jambe %s) refusée: %s (nouvel essai)", r["old_id"], r["leg"], e)
+
+    def _rearm_open(self, now: float, mid: float) -> None:
+        c = self.st["cycle"]
+        r = c["rearm"]
+        leg = r["leg"]
+        d = c["legs"][leg]
+        r["attempts"] += 1
+        r["retry_at"] = now + self.t.rearm_retry_s
+        c["mid_hi"] = c["mid_lo"] = mid
+        d.update(status="pending", intent=None, margin=self._rearm_margin(leg, mid))
+        self.st["intents_valid_until"] = now + self.t.open_deadline_s + self.t.submit_margin_s + self.t.indexer_slack_s
+        self.store.save()  # write-ahead: a crash during the request watches for this order
+        try:
+            d["intent"] = self.v.open(self._wallet(leg), c["coin"], IS_LONG[leg], d["margin"], c["leverage"],
+                                      self.t.open_deadline_s)
+            d["status"] = "sent"
+        except IntentRejected as e:
+            d["status"] = "rejected"
+            log.error("Réouverture de la jambe %s refusée: %s", leg, e)
+        except Exception as e:
+            d["status"] = "unknown"
+            log.warning("Réouverture de la jambe %s: pas de réponse claire (%s), je surveille", leg, e)
+        live = d["status"] in MAYBE_EXECUTED
+        self.st["intents_valid_until"] = self.v.now() + self.t.open_deadline_s + self.t.indexer_slack_s if live else now
+
+    def _end_period(self, now: float, why: str) -> None:
+        """Ends a ladder period early: closes what is open (a re-armed leg's old position is
+        swept as a stray) and books the period once everything is gone."""
+        c = self.st["cycle"]
+        log.warning("%s: fin de la période", why)
+        self._cancel_pending(c)
+        c["rearm"] = None
+        self._send_close(now, list(LEGS))
+        self.st["phase"] = "closing"
+
+    def _rearming(self, now: float) -> None:
+        c = self.st["cycle"]
+        r = c["rearm"]
+        if now < c["next_poll"]:
+            return
+        c["next_poll"] = now + self.t.fast_poll_s
+        mid = self.v.mid(c["coin"])
+        c["mid_hi"], c["mid_lo"] = max(c["mid_hi"], mid), min(c["mid_lo"], mid)
+        leg = r["leg"]
+        other = "B" if leg == "A" else "A"
+        d = c["legs"][leg]
+        w = self._wallet(leg)
+        move = -self._adverse(other, mid)
+        if move >= c["reset"] - 1e-12 or -move >= c["close_move"] - 1e-12:
+            self._end_period(now, f"jambe {other} à {move:+.3%} pendant le réarmement de {leg}")
+            return
+        try:
+            listed = self._read(w)
+        except Exception as e:
+            log.warning("Positions de %s illisibles (%s)", w, e)
+            if r["old_id"] is not None and now - r["close_sent_at"] >= self.t.close_retry_s:
+                self._rearm_close(now)   # closes are idempotent: re-send blindly
+            return
+        if r["old_id"] is not None:
+            if r["old_id"] in listed:
+                r["gone_reads"] = 0
+                if r["close_sends"] >= self.t.max_close_sends:
+                    # The closing phase knows how to deal with a position that will not go away.
+                    self._end_period(now, f"position #{r['old_id']} toujours listée après {r['close_sends']} fermetures")
+                    return
+                old_adverse = (1 - mid / r["old_entry"]) if IS_LONG[leg] else (mid / r["old_entry"] - 1)
+                urgent = old_adverse >= (c["close_move"] + liq_distance(c["leverage"])) / 2
+                if urgent or now - r["close_sent_at"] >= self.t.close_retry_s:
+                    self._rearm_close(now)
+            else:
+                r["gone_reads"] += 1
+                if r["gone_reads"] >= self.t.missing_reads:
+                    r["old_id"] = None
+        if d["pos_id"] is None:
+            self._sync_legs(leg, listed, mid, now)
+        if d["pos_id"] is None:
+            expired = d["status"] in MAYBE_EXECUTED and now >= self.st["intents_valid_until"]
+            if d["status"] in ("not_sent", "rejected") or expired:
+                if expired:
+                    log.warning("Jambe %s: la réouverture n'a jamais été exécutée", leg)
+                    d["status"] = "not_sent"
+                if r["attempts"] >= self.t.rearm_attempts:
+                    self._end_period(now, f"jambe {leg} impossible à rouvrir après {r['attempts']} essais")
+                    return
+                if now >= r["retry_at"]:
+                    self._rearm_open(now, mid)
+        self._sweep(w, listed, self._keep(w), now)
+        if r["old_id"] is None and d["pos_id"] is not None:
+            c["rearm"] = None
+            c["rearms"] = c.get("rearms", 0) + 1
+            self.st["phase"] = "open"
+            c["next_poll"] = now + self.t.positions_every_s / len(LEGS)
+            log.info("Jambe %s réarmée (entrée %.2f), réarmement n°%d de la période", leg, d["entry"], c["rearms"])
+
+    def _send_close(self, now: float, legs: list[str], reset_timer: bool = True) -> None:
+        c = self.st["cycle"]
+        for name in legs:
+            leg = c["legs"][name]
             if leg["pos_id"] is None:
                 continue
             leg["close_sends"] += 1
             leg.setdefault("first_close_at", now)
             try:
-                self.v.close(w, [leg["pos_id"]])
+                self.v.close(self._wallet(name), [leg["pos_id"]])
             except Exception as e:
-                log.error("Fermeture #%s sur %s refusée: %s (nouvel essai)", leg["pos_id"], w, e)
+                log.error("Fermeture #%s (jambe %s) refusée: %s (nouvel essai)", leg["pos_id"], name, e)
         if reset_timer or c["close_sent_at"] is None:
             c["close_sent_at"] = now
         c["next_poll"] = now + self.t.fast_poll_s
@@ -534,31 +781,30 @@ class Bot:
         c["next_poll"] = now + self.t.fast_poll_s
         mid = self.v.mid(c["coin"])
         try:
-            listed = {w: self._read(w) for w in WALLETS}
+            listed = {w: self._read(w) for w in self._cycle_wallets()}
         except Exception as e:
             # Closes are idempotent: keep re-sending blindly the ones not yet confirmed gone.
             log.warning("Positions illisibles (%s): je renvoie les fermetures à l'aveugle si besoin", e)
-            pending = [w for w in WALLETS if c["legs"][w]["pos_id"] is not None
-                       and c["legs"][w]["gone_reads"] < self.t.missing_reads]
+            pending = [leg for leg in LEGS if c["legs"][leg]["pos_id"] is not None
+                       and c["legs"][leg]["gone_reads"] < self.t.missing_reads]
             if pending and self._should_resend(c, pending, mid, now):
                 self._send_close(now, pending)
             return
-        for w in WALLETS:
-            self._sync_legs(w, listed[w], mid, now)
+        self._sync_and_sweep(listed, mid, now)
         visible, unconfirmed = [], []
-        for w in WALLETS:
-            leg = c["legs"][w]
+        for name in LEGS:
+            leg = c["legs"][name]
             if leg["pos_id"] is None:
                 continue
-            if leg["pos_id"] in listed[w]:
+            if leg["pos_id"] in listed[self._wallet(name)]:
                 leg["gone_reads"] = 0
-                visible.append(w)
+                visible.append(name)
             else:
                 leg["gone_reads"] += 1
                 if leg["gone_reads"] < self.t.missing_reads:
-                    unconfirmed.append(w)
-        waiting = [w for w in WALLETS if c["legs"][w]["pos_id"] is None
-                   and c["legs"][w]["status"] in MAYBE_EXECUTED and now < self.st["intents_valid_until"]]
+                    unconfirmed.append(name)
+        waiting = [leg for leg in LEGS if c["legs"][leg]["pos_id"] is None
+                   and c["legs"][leg]["status"] in MAYBE_EXECUTED and now < self.st["intents_valid_until"]]
         if visible:
             sends = max(c["legs"][w]["close_sends"] for w in visible)
             if self._should_resend(c, visible, mid, now):
@@ -609,20 +855,25 @@ class Bot:
         tot["cycles"] += 1
         tot["usd_spent"] += usd
         ea, eb = c["legs"]["A"]["entry"], c["legs"]["B"]["entry"]
-        skewed = bool(ea and eb and abs(ea / eb - 1) > 0.002)  # legs filled far apart: not a normal cycle
+        # Pair legs filled far apart: not a normal cycle (ladder legs are re-opened at other prices on purpose).
+        skewed = c.get("mode") != "ladder" and bool(ea and eb and abs(ea / eb - 1) > 0.002)
         kind = "aborted" if c["aborted"] else "skewed" if skewed else "normal"
         if paper < 0:
             # Some PAPER left the wallet during the cycle (a stake made by hand): the cycle's mint is unknown.
             log.warning("Cycle #%d: PAPER du cycle inconnu (stake manuel pendant le cycle ?), exclu du plafond", c["n"])
             kind, paper = "unknown", 0.0
         tot["paper_minted"] += paper
+        mode, rearms = c.get("mode", "pair"), c.get("rearms", 0)
         if kind != "unknown":
-            self.st["cycles_all"].append({"ts": now, "usd": usd, "paper": paper, "kind": kind})
+            self.st["cycles_all"].append({"ts": now, "usd": usd, "paper": paper, "kind": kind, "mode": mode,
+                                          "rearms": rearms})
             del self.st["cycles_all"][:-1000]
         if kind == "normal":
-            self.st["history"].append({"ts": now, "usd": usd, "paper": paper})
+            self.st["history"].append({"ts": now, "usd": usd, "paper": paper, "mode": mode, "rearms": rearms})
             del self.st["history"][:-1000]
         note = {"aborted": "(avorté) ", "skewed": "(entrées décalées) ", "normal": "", "unknown": "(PAPER inconnu) "}[kind]
+        if mode == "ladder":
+            note += f"(échelle, {rearms} réarmement(s)) "
         log.info("Cycle #%d %sterminé en %.0f min: coût %.2f$, +%s PAPER (%.2f$/1000). Total: %s PAPER pour %.2f$",
                  c["n"], note, (now - c["started"]) / 60, usd, f"{paper:,.0f}",
                  cost_per_1000(usd, paper), f"{tot['paper_minted']:,.0f}", tot["usd_spent"])

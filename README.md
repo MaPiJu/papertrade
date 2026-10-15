@@ -38,7 +38,9 @@ Dans tous les cas :
   vers HyperCore, puis l'envoie à l'adresse de dépôt PaperTrade de l'autre wallet ;
 - **arrêt automatique** : dès que le coût moyen des `COST_WINDOW` derniers cycles dépasse 7 $ pour 1 000 PAPER, le
   bot arrête d'ouvrir des positions (l'émission baisse avec le temps), mais continue de staker. Le coût cumulé de
-  tous les cycles (avortés compris) est aussi surveillé.
+  tous les cycles (avortés compris) est aussi surveillé. Un cycle écourté (réouverture refusée, solde insuffisant,
+  `close-cycle`, session key bientôt expirée) ne compte que dans ce cumul : encaissé sur un petit mouvement, il coûte
+  plus cher sans rien dire de la rentabilité du farming.
 
 ```
 idle ──► (transfert B→A ou rééquilibrage) ──► ouverture long + short ──► surveillance du prix BBO Hyperliquid
@@ -229,7 +231,8 @@ l'émission 18,9 : 0,20 % → ~11 $/1 000, 0,70 % → ~7,8 $, 1 % → ~7,4 $, 2 
 - **Ordres** : intents EIP-712 signés localement et envoyés à `POST https://exchange.papertrade.xyz/intents`
   (gasless). Ouverture/fermeture signées par une session key enregistrée par le wallet ; stake, retrait et
   annulation signés par le wallet principal. Les session keys sont demandées pour 6 jours et renouvelées entre deux
-  cycles, 2 jours avant leur échéance. Les 4 clés précédentes encore valides sont gardées en secours (si le relayer
+  cycles, 2 jours avant leur échéance ; un cycle encore ouvert 1 jour avant l'échéance est fermé pour permettre le
+  renouvellement. Les 4 clés précédentes encore valides sont gardées en secours (si le relayer
   traîne, celle qu'il active n'est pas forcément la dernière) ; une clé refusée en pleine fermeture déclenche un
   nouvel enregistrement, au plus un par minute.
 - **Prix** : BBO mid Hyperliquid (`l2Book`), le même prix que PaperTrade utilise pour ouvrir et fermer.

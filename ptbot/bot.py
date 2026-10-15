@@ -29,7 +29,7 @@ import threading
 from dataclasses import dataclass
 from pathlib import Path
 
-from .constants import SCALE, STAKE_DEADLINE_S, WITHDRAW_DEADLINE_S
+from .constants import SCALE, SESSION_KEY_RENEW_S, STAKE_DEADLINE_S, WITHDRAW_DEADLINE_S
 from .papertrade_api import IntentRejected
 from .positions import Position, plausible_price
 from .strategy import (MIN_CORE_TRANSFER_USD, MIN_DEPOSIT_USD, Params, Skip, Transfer, cost_cap_hit, cost_per_1000,
@@ -42,6 +42,9 @@ LEGS = ("A", "B")                   # leg A is the long, leg B the short: on wal
 IS_LONG = {"A": True, "B": False}
 # Leg statuses whose order may still execute ('pending' = state saved before the request, then a crash).
 MAYBE_EXECUTED = ("sent", "unknown", "pending")
+# A cycle is closed early when a session key gets this close to expiry (keys are renewed between
+# cycles, SESSION_KEY_RENEW_S before expiry), so its closes can always be signed.
+KEY_MIN_LEFT_S = SESSION_KEY_RENEW_S / 2
 SCHEMA = 3
 
 
@@ -234,6 +237,14 @@ class Bot:
             known.append(pid)
             del known[:-500]
 
+    def _keys_ok(self, margin_s: float) -> bool:
+        keys_ready = getattr(self.v, "keys_ready", None)
+        try:
+            return not keys_ready or keys_ready(margin_s=margin_s)
+        except Exception as e:
+            log.warning("Expiration des session keys illisible (%s)", e)
+            return True
+
     def _wallet(self, leg: str) -> str:
         """Wallet carrying a leg of the current cycle (cycles of older versions: leg = wallet)."""
         c = self.st.get("cycle") or {}
@@ -304,6 +315,10 @@ class Bot:
         if maintain and now >= self.st.get("next_key_check", 0):
             self.st["next_key_check"] = now + self.t.key_check_s
             maintain()   # no pair is open here: a renewal can never leave a close unsigned
+        if not self._keys_ok(KEY_MIN_LEFT_S):
+            self.st["next_key_check"] = 0   # renewal refused or not answered: try again next round
+            self._say_once("Session keys bientôt expirées et pas encore renouvelées: pas de nouveau cycle")
+            return
         if self.st.get("paused"):
             self._say_once(f"En pause: {self.st['paused']}")
             return
@@ -553,6 +568,11 @@ class Bot:
     # --- open: watch the price, close (or re-arm) legs before liquidation ----
     def _open(self, now: float) -> None:
         c = self.st["cycle"]
+        if now >= c.get("next_key_check", 0):
+            c["next_key_check"] = now + self.t.key_check_s
+            if not self._keys_ok(KEY_MIN_LEFT_S):
+                self._end_period(now, "Session key bientôt expirée (le cycle a duré trop longtemps)")
+                return
         mid = self.v.mid(c["coin"])
         worst = max(self._adverse(leg, mid) for leg in LEGS)
         if c.get("mode") == "ladder":
@@ -623,13 +643,13 @@ class Bot:
         try:
             free = self.v.usdc(w)
         except Exception as e:
-            log.warning("Solde de %s illisible (%s): réarmement au prochain tour", w, e)
-            return
+            # The losing leg must not wait for the balance: an open too big for the wallet is refused,
+            # and refused re-opens end the period.
+            log.warning("Solde de %s illisible (%s): je réarme quand même", w, e)
+            free = None
         margin = self._rearm_margin(leg, mid)
-        if free < margin + 0.05:   # the new leg locks its margin before the old one gives its back
-            log.info("Wallet %s: %.2f$ libres, trop peu pour réarmer la jambe %s: fin de la période", w, free, leg)
-            self._send_close(now, list(LEGS))
-            self.st["phase"] = "closing"
+        if free is not None and free < margin + 0.05:   # the new leg locks its margin before the old one gives its back
+            self._end_period(now, f"Wallet {w}: {free:.2f}$ libres, trop peu pour réarmer la jambe {leg}")
             return
         notional = d.get("margin", c["margin"]) * c["leverage"]
         loss = self._adverse(leg, mid) * notional
@@ -689,10 +709,12 @@ class Bot:
         self.st["intents_valid_until"] = self.v.now() + self.t.open_deadline_s + self.t.indexer_slack_s if live else now
 
     def _end_period(self, now: float, why: str) -> None:
-        """Ends a ladder period early: closes what is open (a re-armed leg's old position is
-        swept as a stray) and books the period once everything is gone."""
+        """Ends a cycle early: closes what is open (a re-armed leg's old position is swept as a
+        stray) and books it once everything is gone, outside the cost cap's window (a cut cycle
+        realises its winner on a small move, an expensive one that says nothing about the farm)."""
         c = self.st["cycle"]
-        log.warning("%s: fin de la période", why)
+        log.warning("%s: fin de %s", why, "la période" if c.get("mode") == "ladder" else "la paire")
+        c["cut"] = why
         self._cancel_pending(c)
         c["rearm"] = None
         self._send_close(now, list(LEGS))
@@ -857,7 +879,7 @@ class Bot:
         ea, eb = c["legs"]["A"]["entry"], c["legs"]["B"]["entry"]
         # Pair legs filled far apart: not a normal cycle (ladder legs are re-opened at other prices on purpose).
         skewed = c.get("mode") != "ladder" and bool(ea and eb and abs(ea / eb - 1) > 0.002)
-        kind = "aborted" if c["aborted"] else "skewed" if skewed else "normal"
+        kind = "aborted" if c["aborted"] else "cut" if c.get("cut") else "skewed" if skewed else "normal"
         if paper < 0:
             # Some PAPER left the wallet during the cycle (a stake made by hand): the cycle's mint is unknown.
             log.warning("Cycle #%d: PAPER du cycle inconnu (stake manuel pendant le cycle ?), exclu du plafond", c["n"])
@@ -871,7 +893,8 @@ class Bot:
         if kind == "normal":
             self.st["history"].append({"ts": now, "usd": usd, "paper": paper, "mode": mode, "rearms": rearms})
             del self.st["history"][:-1000]
-        note = {"aborted": "(avorté) ", "skewed": "(entrées décalées) ", "normal": "", "unknown": "(PAPER inconnu) "}[kind]
+        note = {"aborted": "(avorté) ", "cut": "(écourté, hors plafond par cycle) ", "skewed": "(entrées décalées) ",
+                "normal": "", "unknown": "(PAPER inconnu) "}[kind]
         if mode == "ladder":
             note += f"(échelle, {rearms} réarmement(s)) "
         log.info("Cycle #%d %sterminé en %.0f min: coût %.2f$, +%s PAPER (%.2f$/1000). Total: %s PAPER pour %.2f$",

@@ -82,7 +82,8 @@ def test_refused_reopens_end_the_period_without_a_naked_leg(tmp_path):
         bot.run(max_steps=1)
     st = store.data
     assert venue.calls["open", "B", "short"] == 1 + bot.t.rearm_attempts
-    assert st["totals"]["cycles"] == 1 and st["history"][0]["rearms"] == 0
+    assert st["totals"]["cycles"] == 1 and st["cycles_all"][0]["rearms"] == 0
+    assert st["cycles_all"][0]["kind"] == "cut" and not st["history"]      # outside the per-cycle cost cap
     assert not venue.accounts["A"].positions and not venue.accounts["B"].positions   # the long was closed too
 
 
@@ -124,8 +125,8 @@ def test_rearm_stops_when_the_losing_wallet_cannot_afford_it(tmp_path):
     venue.accounts["B"].usdc = 3.0          # e.g. spent elsewhere: the next step cannot be paid for
     while store.data["totals"]["cycles"] == 0 and venue.now() - T0 < 400:
         bot.run(max_steps=1)
-    h = store.data["history"][0]
-    assert h["rearms"] == 0 and venue.calls["open", "B"] == 1
+    h = store.data["cycles_all"][0]
+    assert h["rearms"] == 0 and h["kind"] == "cut" and venue.calls["open", "B"] == 1
     assert not venue.accounts["A"].positions and not venue.accounts["B"].positions
     assert venue.liquidations == 0
 
@@ -189,3 +190,57 @@ def test_close_cycle_books_the_open_cycle_and_stops(tmp_path):
     bot.run(stop_when_idle=True)
     assert store.data["phase"] == "idle" and store.data["totals"]["cycles"] == 1
     assert not venue.accounts["A"].positions and not venue.accounts["B"].positions
+
+
+def test_an_unreadable_balance_does_not_hold_back_the_losing_leg(tmp_path):
+    class RpcDown(FaultVenue):
+        rpc_down = False
+
+        def usdc(self, w):
+            if self.rpc_down:
+                raise RuntimeError("HyperEVM RPC timeout")
+            return super().usdc(w)
+
+    points = [(0, 100_000), (100, 99_740), (130, 99_650), (160, 99_560), (190, 99_400)]
+    venue, store, bot = make(tmp_path, points, ladder(), venue_cls=RpcDown)
+    run_until(bot, 60)
+    venue.rpc_down = True
+    run_until(bot, 240)
+    venue.positions("A")                     # the simulator liquidates on reads
+    assert venue.liquidations == 0
+    assert venue.calls["close", "A"] == 2 and store.data["cycle"]["rearms"] == 2
+
+
+def test_a_period_cut_by_refusals_does_not_pause_the_farm(tmp_path):
+    class RefuseFor30s(FaultVenue):
+        def open(self, w, coin, is_long, margin, leverage, deadline_s):
+            if T0 + 59 <= self.clock < T0 + 89:
+                raise IntentRejected("openPosition refusé (HTTP 409): {'reason': 'openInterest'}")
+            return super().open(w, coin, is_long, margin, leverage, deadline_s)
+
+    venue = RefuseFor30s(Path([(0, 100_000), (60, 100_260)]), start_usdc=55.0, emission=18.9, min_notional=1000.0)
+    store = StateStore(tmp_path / "state.json")
+    bot = Bot(venue, Params(), store, Timing())
+    run_until(bot, 400)
+    st = store.data
+    assert [c["kind"] for c in st["cycles_all"]] == ["cut"] and not st["history"]
+    assert not st.get("paused") and st["phase"] == "open"         # the next period is running
+
+
+def test_a_cycle_is_closed_before_its_session_keys_expire(tmp_path):
+    class Keys(FaultVenue):
+        expiry = T0 + 3 * 86400
+
+        def keys_ready(self, margin_s=3600):
+            return self.expiry - self.clock > margin_s
+
+    venue, store, bot = make(tmp_path, [(0, 100_000)], ladder(), venue_cls=Keys)
+    run_until(bot, 100)
+    assert store.data["phase"] == "open"
+    run_until(bot, 2 * 86400 + 900)          # nothing moves: the period would never end on its own
+    st = store.data
+    assert [c["kind"] for c in st["cycles_all"]] == ["cut"] and st["phase"] == "idle"
+    assert not venue.accounts["A"].positions and not venue.accounts["B"].positions
+    venue.expiry = venue.clock + 6 * 86400   # renewed
+    run_until(bot, 2 * 86400 + 1100)
+    assert st["phase"] in ("opening", "open")

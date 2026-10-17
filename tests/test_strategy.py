@@ -176,3 +176,12 @@ def test_a_pair_after_ladder_periods_is_judged_on_pairs_only():
     ladder = [{"usd": u, "paper": 1000.0, "mode": "ladder"} for u in (8.5, 7.9, 6.0)]   # noisy, avg 7.47
     hit, avg = cost_cap_hit(ladder + [{"usd": 6.8, "paper": 1000.0, "mode": "pair"}], p)
     assert not hit and abs(avg - 6.8) < 1e-9
+
+
+def test_a_fixed_ladder_reset_above_the_cap_is_refused():
+    from ptbot.strategy import plan_ladder
+    p = Params(strategy="ladder", one_wallet=True, ladder_reset=0.01)          # +1%: ~7.35$/1000 at E=18.9
+    plan = plan_ladder({"A": 110.0, "B": 0.0}, 10, 1000, 18.9, p)
+    assert isinstance(plan, Skip) and not plan.capital and "plafond" in plan.reason
+    p75 = Params(strategy="ladder", one_wallet=True, ladder_reset=0.01, max_cost_per_1000=7.5)
+    assert plan_ladder({"A": 110.0, "B": 0.0}, 10, 1000, 18.9, p75).reset == 0.01

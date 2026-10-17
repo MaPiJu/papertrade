@@ -238,7 +238,7 @@ le fausserait. `stake-now` refuse tant qu'un cycle est en cours ; arrêtez d'abo
 | `ONE_WALLET` | false | long et short sur le wallet A, l'USDC de B y est transféré une fois (test `--straddle` requis) ; conseillé avec l'échelle |
 | `LADDER_STEP_PCT` | 0.20 | échelle : perte à laquelle une jambe est rouverte et l'ancienne fermée |
 | `LADDER_LIQ_BUFFER_PCT` | 0.25 | échelle : liquidation des jambes à cette distance au-delà de la marche (fixe leur levier : x200 par défaut) |
-| `LADDER_RESET_PCT` | 0 | échelle : gain qui termine la période ; 0 = calculé depuis l'émission pour rester 2 % sous le plafond |
+| `LADDER_RESET_PCT` | 0 | échelle : gain qui termine la période ; 0 = calculé depuis l'émission pour rester 2 % sous le plafond ; une valeur fixée dont le coût prévu dépasse le plafond est refusée (1 % ≈ 7,35 $/1 000 à l'émission 18,9) |
 | `LADDER_MAX_LEVERAGE` | 1000 | échelle : levier maximum des jambes |
 | `LEVERAGE` / `MAX_LEVERAGE` | 250 / 250 | paire : levier visé / levier max autorisé pour rester au notionnel minimum |
 | `TARGET_NOTIONAL_USD` | 11000 | paire : marge par jambe = notionnel visé / levier (44 $ en x250) ; 0 = tout le solde |

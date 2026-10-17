@@ -158,6 +158,10 @@ def plan_ladder(free: dict[str, float], min_margin: float, min_notional: float, 
         what = f"émission {emission:.1f} PAPER/$" if emission else "émission illisible"
         return Skip(f"{what}: même en laissant le gagnant courir jusqu'à {MAX_LADDER_RESET:.0%}, le coût "
                     f"dépasserait {p.max_cost_per_1000:.2f}$/1000 PAPER")
+    cost = cost_per_1000_at(reset, emission, p.coin) if emission else None
+    if p.ladder_reset > 0 and cost is not None and cost > p.max_cost_per_1000:
+        return Skip(f"encaissement à +{reset:.2%} (LADDER_RESET_PCT): coût prévu {cost:.2f}$/1000 PAPER à l'émission "
+                    f"actuelle ({emission:.2f}) > plafond {p.max_cost_per_1000:.2f}$ (MAX_COST_PER_1000_PAPER)")
     step = p.ladder_step
     # The old leg of a re-arm is closed ~5-10 s after the step is seen: the buffer must absorb that
     # window's move even when volatility spikes (0.25% keeps liquidations rare in simulations).

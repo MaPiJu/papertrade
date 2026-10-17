@@ -143,14 +143,23 @@ def cmd_plan(settings, args) -> None:
     """Read-only: what the bot would do right now."""
     import math
 
-    from .strategy import (MIN_CORE_TRANSFER_USD, MINT_FACTOR, Skip, cost_per_1000_at, plan_ladder, plan_open,
-                           plan_rebalance, win_payout)
+    from .strategy import (LADDER_COST_WINDOW, MIN_CORE_TRANSFER_USD, MINT_FACTOR, Skip, choose_plan,
+                           cost_per_1000_at, plan_rebalance, win_payout)
 
     venue = build_live(settings)
     p = settings.params
     bal = {w: venue.usdc(w) for w in ("A", "B")}
     mins = venue.minimums()
     emission = venue.paper_emission()
+    try:
+        cycle = json.loads((settings.state_dir / "state.json").read_text()).get("cycle")
+    except (FileNotFoundError, ValueError):
+        cycle = None
+    if cycle:
+        print(f"Cycle #{cycle['n']} en cours ({cycle.get('mode', 'pair')}, x{cycle['leverage']}): ce qui suit vaut pour "
+              "le cycle suivant, avec la marge que celui-ci bloque encore (au gain ou à la perte près)")
+        for w in bal:
+            bal[w] += sum(pos.margin or 0 for pos in venue.positions(w))
     print(f"Soldes PaperTrade: A={bal['A']:.2f}$  B={bal['B']:.2f}$   minimums: marge {mins[0]:.2f}$, notionnel {mins[1]:,.0f}$")
     print(f"Émission: {f'~{emission:.2f} PAPER par $ perdu' if emission else 'illisible'}   stratégie: {p.strategy}"
           f"{', un seul wallet (A)' if p.one_wallet else ''}")
@@ -165,21 +174,18 @@ def cmd_plan(settings, args) -> None:
             print(f"-> d'abord rééquilibrer: {t.amount:.2f}$ de {t.src} vers {t.dst}")
             half = (bal["A"] + bal["B"]) / 2
             bal = {"A": half, "B": half}
-    if p.strategy == "ladder":
-        plan = plan_ladder(bal, *mins, emission, p)
-    elif p.one_wallet:
-        plan = plan_open(bal["A"] / 2, bal["A"] / 2, *mins, p)
-    else:
-        plan = plan_open(bal["A"], bal["B"], *mins, p)
+    plan, note = choose_plan(bal, *mins, emission, p)
+    if note:
+        print(f"-> {note}")
     if isinstance(plan, Skip):
         print(f"-> pas de cycle: {plan.reason}")
         return
-    if p.strategy == "ladder":
+    if plan.reset:
         step_loss = plan.notional * plan.close_move
         cost = plan.notional * (plan.reset - win_payout(plan.reset, p.coin))
         print(f"-> échelle: long + short de {plan.margin:.2f}$ x{plan.leverage} ({plan.notional:,.0f}$ de notionnel "
               f"chacun){' sur A' if p.one_wallet else ''}")
-        print(f"   la jambe qui perd {plan.close_move:.2%} est fermée et rouverte (~{step_loss:.2f}$ de perte, "
+        print(f"   la jambe qui perd {plan.close_move:.2%} est rouverte et l'ancienne fermée (~{step_loss:.2f}$ de perte, "
               f"~{step_loss * MINT_FACTOR * (emission or 0):,.0f} PAPER par marche); liquidation à "
               f"{1 / plan.leverage - 0.0005:.2%}")
         print(f"   période terminée quand l'autre jambe gagne {plan.reset:.2%}: ~{plan.reset / plan.close_move:.0f} "
@@ -194,7 +200,11 @@ def cmd_plan(settings, args) -> None:
               f"(~{loss * MINT_FACTOR * (emission or 0):,.0f} PAPER), coût net ~{cost:.2f}$"
               + (f" (~{cost_per_1000_at(plan.close_move, emission, p.coin):.2f}$/1000, plafond "
                  f"{p.max_cost_per_1000:.2f}$)" if emission else ""))
-    print(f"   Le coût réel est mesuré après chaque période et comparé au plafond sur {p.cost_window} période(s).")
+    if plan.reset:
+        print(f"   Le coût réel de chaque période varie de ~±1$/1000 autour de ce chiffre (latence des ordres): le bot "
+              f"s'arrête si la moyenne des {LADDER_COST_WINDOW} dernières périodes dépasse nettement le plafond.")
+    else:
+        print(f"   Le coût réel est mesuré après chaque cycle et comparé au plafond sur {p.cost_window} cycle(s).")
 
 
 def cmd_register(settings, args) -> None:
@@ -207,16 +217,25 @@ def cmd_register(settings, args) -> None:
                          "s'il parle d'origine/cookie, le relayer refuse les clients hors site: n'allez pas plus loin.")
 
 
+def straddle_passed(settings) -> bool:
+    """The long + short test on wallet A passed (tools/preflight_tiny_trade.py --straddle)."""
+    try:
+        verdict = json.loads((settings.state_dir / "preflight" / "straddle_A.json").read_text()).get("verdict", [])
+    except (FileNotFoundError, ValueError):
+        return False
+    return not any(v[0] == "FAIL" for v in verdict) and any(v[0] == "PASS" and "coexist" in v[1] for v in verdict)
+
+
 def startup_problems(settings, venue) -> list[str]:
     """What must hold before the bot may trade real money (README, «Mise en route»)."""
     problems = []
     if not venue.keys_ready():
         problems.append("session keys absentes ou proches de l'expiration: `python -m ptbot register`, "
                         "puis attendez 5 minutes")
+    # ONE_WALLET's long + short test is required later, by the bot itself, before its first one-wallet
+    # cycle: B's USDC is on A by then, and a pair of the previous version can finish first.
     checks = [(w, "tiny_trade", "visible", "mini-position de test du wallet", "--wallet {w}")
               for w in (("A",) if settings.params.one_wallet else settings.wallets)]
-    if settings.params.one_wallet:
-        checks.append(("A", "straddle", "coexist", "test long + short sur le wallet", "--wallet {w} --straddle"))
     for w, name, key, what, flags in checks:
         path = settings.state_dir / "preflight" / f"{name}_{w}.json"
         try:
@@ -285,12 +304,15 @@ def cmd_run(settings, args) -> None:
         if input("Tapez OUI pour continuer: ").strip().upper() != "OUI":
             return
     store = StateStore(settings.state_dir / "state.json")
-    log.info("Démarrage: A=%s (long), B=%s (short), %s x%d", venue.addr("A"), venue.addr("B"),
-             settings.params.coin, settings.params.leverage)
+    p = settings.params
+    log.info("Démarrage: A=%s, B=%s, %s, stratégie %s%s", venue.addr("A"), venue.addr("B"), p.coin,
+             f"échelle (marche {p.ladder_step:.2%})" if p.strategy == "ladder"
+             else f"paire x{p.leverage} (sortie {p.close_move:.2%})", ", un seul wallet (A)" if p.one_wallet else "")
     try:
         bot = Bot(venue, settings.params, store, Timing(open_deadline_s=settings.open_deadline_s))
     except IncompatibleState as e:
         raise SystemExit(str(e))
+    bot.straddle_check = lambda: straddle_passed(settings)
     bot.run(stop_file=Path("STOP"))
 
 

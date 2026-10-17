@@ -79,13 +79,14 @@ def test_a_failed_tiny_trade_blocks_the_start(tmp_path):
     assert any("wallet B en échec" in p for p in startup_problems(settings(tmp_path), venue))
 
 
-def test_one_wallet_mode_needs_the_straddle_test_but_not_b(tmp_path):
+def test_one_wallet_mode_needs_neither_b_nor_the_straddle_test_to_start(tmp_path):
+    from ptbot.__main__ import straddle_passed
     (tmp_path / "preflight").mkdir()
     ok = {"verdict": [["PASS", "position visible after 4s"]]}
     (tmp_path / "preflight" / "tiny_trade_A.json").write_text(json.dumps(ok))
     venue = Venue(Api({"0xA": "0xda", "0xB": "0xdb"}), Evm())
-    problems = " | ".join(startup_problems(settings(tmp_path, one_wallet=True), venue))
-    assert "--straddle" in problems and "wallet B" not in problems
+    assert startup_problems(settings(tmp_path, one_wallet=True), venue) == []   # the bot asks for it later
+    assert not straddle_passed(settings(tmp_path))
     straddle = {"verdict": [["PASS", "long and short coexist as two positions on one wallet"]]}
     (tmp_path / "preflight" / "straddle_A.json").write_text(json.dumps(straddle))
-    assert startup_problems(settings(tmp_path, one_wallet=True), venue) == []
+    assert straddle_passed(settings(tmp_path))

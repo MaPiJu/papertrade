@@ -124,13 +124,55 @@ def test_ladder_sizing_lets_the_losing_side_pay_a_whole_period():
     assert cost_per_1000_at(reset, 18.9) <= 7.0 * 0.98 < cost_per_1000_at(reset - 0.0005, 18.9)
     two = plan_ladder({"A": 54.1, "B": 55.4}, 10, 1000, 18.9, p)
     assert two.reset == reset and two.close_move == 0.0025
-    assert 1 / two.leverage - 0.0005 - 0.0025 >= p.liq_safety - 1e-9            # liquidation stays 0.15% away
+    assert 1 / two.leverage - 0.0005 - 0.0025 >= p.ladder_liq_buffer - 1e-9      # liquidation stays 0.25% away
     assert 2 * two.margin + (reset + 0.0025) * two.notional <= 54.1 + 0.01      # B alone can pay a whole period
     one = plan_ladder({"A": 109.0, "B": 0.0}, 10, 1000, 18.9, Params(strategy="ladder", one_wallet=True))
-    assert 3 * one.margin + (reset + 0.0025) * one.notional <= 109.0 + 0.01
+    assert one.close_move == 0.002 and one.leverage == 200                     # defaults: step 0.20%, liquidation 0.45%
+    assert 3 * one.margin + (one.reset + one.close_move) * one.notional <= 109.0 + 0.01
     assert one.notional > 1.6 * two.notional                                    # one pool funds both sides
     small = plan_ladder({"A": 50.0, "B": 50.0}, 10, 1000, 18.9, p)               # min margin: lower leverage
     assert 10 < small.margin < 10.5 and small.leverage < two.leverage            # room to shrink with the price
     assert isinstance(plan_ladder({"A": 12.0, "B": 12.0}, 10, 1000, 18.9, p), Skip)
     assert isinstance(plan_ladder({"A": 54.0, "B": 54.0}, 10, 1000, 16.5, p), Skip)  # no move is cheap enough
     assert plan_ladder({"A": 60.0, "B": 60.0}, 10, 1000, None, Params(ladder_reset=0.03)).reset == 0.03
+
+
+def test_a_margin_cap_never_raises_the_ladder_leverage_past_its_liquidation_buffer():
+    from ptbot.strategy import plan_ladder
+    for one_wallet, free in ((True, {"A": 110.0, "B": 0.0}), (False, {"A": 300.0, "B": 300.0})):
+        p = Params(strategy="ladder", one_wallet=one_wallet, max_margin_usd=10)
+        plan = plan_ladder(free, 10, 1000, 18.9, p)
+        assert plan.leverage <= 200 and 1 / plan.leverage - 0.0005 - plan.close_move >= 0.0025 - 1e-9
+
+
+def test_choose_plan_refuses_a_pair_that_costs_more_than_the_cap():
+    from ptbot.strategy import choose_plan
+    pair = Params(strategy="pair", leverage=250, max_leverage=250, close_move=0.007)   # x250: exit at 0.20%
+    plan, _ = choose_plan({"A": 50.0, "B": 50.0}, 10, 1000, 18.9, pair)
+    assert isinstance(plan, Skip) and "plafond" in plan.reason
+    x40 = Params(strategy="pair", leverage=40, max_leverage=40, close_move=0.02, target_notional=0)
+    assert isinstance(choose_plan({"A": 50.0, "B": 50.0}, 10, 1000, 18.9, x40)[0], OpenPlan)
+    # Too little for the ladder: a pair closed at the ladder's reset move, which costs what a period would.
+    plan, note = choose_plan({"A": 30.0, "B": 30.0}, 10, 1000, 18.9, Params(strategy="ladder"))
+    assert note and plan.close_move == 0.0205 and plan.leverage <= 44
+
+
+def test_ladder_cost_rule_ignores_fill_noise_but_not_a_real_excess():
+    import random
+
+    from ptbot.strategy import cost_cap_hit
+    p = Params(strategy="ladder", max_cost_per_1000=7.0, cost_window=3)
+    rng = random.Random(1)
+
+    def periods(mean, n):
+        return [{"usd": max(0.1, rng.gauss(mean, 1.0)) * 1.15, "paper": 1150.0, "mode": "ladder"} for _ in range(n)]
+    noisy = periods(6.86, 60)
+    assert not any(cost_cap_hit(noisy[:i], p)[0] for i in range(1, 61))     # ±1$/1000 per period around 6.86
+    assert cost_cap_hit(periods(9.0, 5), p)[0]                               # emission misread, fees changed...
+
+
+def test_a_pair_after_ladder_periods_is_judged_on_pairs_only():
+    p = Params(max_cost_per_1000=7.0, cost_window=3)
+    ladder = [{"usd": u, "paper": 1000.0, "mode": "ladder"} for u in (8.5, 7.9, 6.0)]   # noisy, avg 7.47
+    hit, avg = cost_cap_hit(ladder + [{"usd": 6.8, "paper": 1000.0, "mode": "pair"}], p)
+    assert not hit and abs(avg - 6.8) < 1e-9

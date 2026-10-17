@@ -12,7 +12,7 @@ Farming stops once a cycle costs more than `max_cost_per_1000` USD per 1,000 PAP
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from .constants import LIQ_BUFFER
 
@@ -33,7 +33,8 @@ class Params:
     max_cost_per_1000: float = 7.0     # USD per 1,000 PAPER above which farming stops
     cost_window: int = 1               # cycles averaged for the cost cap (1 = rusk0f's per-cycle rule)
     strategy: str = "ladder"           # "ladder" (re-arm the losing leg) or "pair" (close both together)
-    ladder_step: float = 0.0025        # ladder: the losing leg is closed and re-opened after this move
+    ladder_step: float = 0.002         # ladder: the losing leg is closed and re-opened after this move
+    ladder_liq_buffer: float = 0.0025  # ladder legs: liquidation this far beyond the step (sets their leverage)
     ladder_reset: float = 0.0          # ladder: winner's gain that ends the period (0 = from emission and cap)
     ladder_cost_margin: float = 0.02   # ladder auto reset: aim this far under the cost cap
     ladder_max_leverage: int = 1000    # ladder legs: leverage set by the step (LEVERAGE is for "pair")
@@ -158,9 +159,11 @@ def plan_ladder(free: dict[str, float], min_margin: float, min_notional: float, 
         return Skip(f"{what}: même en laissant le gagnant courir jusqu'à {MAX_LADDER_RESET:.0%}, le coût "
                     f"dépasserait {p.max_cost_per_1000:.2f}$/1000 PAPER")
     step = p.ladder_step
-    max_lev = min(p.ladder_max_leverage, int(1 / (step + LIQ_BUFFER + p.liq_safety)))
+    # The old leg of a re-arm is closed ~5-10 s after the step is seen: the buffer must absorb that
+    # window's move even when volatility spikes (0.25% keeps liquidations rare in simulations).
+    max_lev = min(p.ladder_max_leverage, int(1 / (step + LIQ_BUFFER + p.ladder_liq_buffer)))
     if max_lev < 1:
-        return Skip(f"pas de {step:.2%}: liquidation trop proche pour LIQ_SAFETY")
+        return Skip(f"pas de {step:.2%}: liquidation trop proche pour LADDER_LIQ_BUFFER_PCT")
     # Margins locked at once: each leg, plus a re-armed leg's new one before its old one comes back.
     legs_on_pool = 3 if p.one_wallet else 2
     pool = (free.get("A", 0.0) if p.one_wallet else min(free.values())) * p.margin_fraction
@@ -176,13 +179,42 @@ def plan_ladder(free: dict[str, float], min_margin: float, min_notional: float, 
     if margin < floor_margin:
         # Not enough capital at this leverage: keep the minimum margin and lower the leverage.
         margin = floor_margin
-        leverage = int((pool / floor_margin - legs_on_pool) / span)
+        leverage = min(max_lev, int((pool / floor_margin - legs_on_pool) / span))
     margin = max(floor_cents(margin), floor_margin)
     if leverage < 1 or margin * leverage < floor_notional:
         return Skip(f"capital trop faible pour l'échelle: {pool:.2f}$ disponibles pour couvrir "
                     f"{span:.2%} de pertes d'un côté (minimums {min_margin:.0f}$ de marge, {min_notional:,.0f}$ "
                     "de notionnel)", capital=True)
     return OpenPlan(margin=margin, leverage=leverage, close_move=step, reset=reset)
+
+
+def choose_plan(bal: dict[str, float], min_margin: float, min_notional: float, emission: float | None,
+                p: Params) -> tuple[OpenPlan | Skip, str | None]:
+    """The next cycle and, when the ladder had to give way to a pair, why. A pair whose exit would
+    cost more than the cap at the current emission is refused: that is the cap's own rule, applied
+    before paying rather than after."""
+    note = None
+    pair_p = p
+    if p.strategy == "ladder":
+        plan = plan_ladder(bal, min_margin, min_notional, emission, p)
+        if not (isinstance(plan, Skip) and plan.capital):
+            return plan, None
+        # A pair closed at the ladder's reset move costs what a period would.
+        note = f"{plan.reason}: paire classique à la place"
+        reset = ladder_reset_move(emission, p)
+        lev = max(1, int(1 / (reset + LIQ_BUFFER + p.liq_safety)))
+        pair_p = replace(p, close_move=reset, leverage=min(p.leverage, lev), max_leverage=lev)
+    pair_bal = (bal["A"] / 2, bal["A"] / 2) if p.one_wallet else (bal["A"], bal["B"])
+    plan = plan_open(*pair_bal, min_margin, min_notional, pair_p)
+    if isinstance(plan, Skip) and pair_p is not p:
+        plan = Skip(f"paire de repli limitée à x{pair_p.leverage} pour fermer à ±{pair_p.close_move:.2%} (coût d'une "
+                    f"période): {plan.reason.split(':')[0]}; rechargez le wallet")
+    if isinstance(plan, OpenPlan) and emission:
+        cost = cost_per_1000_at(plan.close_move, emission, p.coin)
+        if cost > p.max_cost_per_1000:
+            plan = Skip(f"paire x{plan.leverage} fermée à ±{plan.close_move:.2%}: coût prévu {cost:.2f}$/1000 PAPER "
+                        f"à l'émission actuelle ({emission:.2f}) > plafond {p.max_cost_per_1000:.2f}$")
+    return plan, note
 
 
 # PaperTrade withdrawals and deposits through HyperCore need 10 USDC, and a wallet's first
@@ -222,12 +254,39 @@ def cost_per_1000(usd_spent: float, paper_minted: float) -> float:
     return math.inf if paper_minted <= 0 else usd_spent / paper_minted * 1000
 
 
+# A ladder period's cost is set by its reset move and the emission, but fill timing adds noise
+# around it (the re-opened leg and the old one fill seconds apart, ~1$/1000 per period). So its
+# realised cost is judged over many periods, and only a clear excess over the cap pauses the farm
+# (the expected cost is already held under the cap when each period is planned).
+LADDER_COST_WINDOW = 20
+LADDER_COST_Z = 2.5
+
+
 def cost_cap_hit(history: list[dict], p: Params) -> tuple[bool, float]:
     """Average cost of the last `cost_window` cycles against the cap (judged only
     once that many cycles exist, so one unlucky cycle doesn't stop the farm)."""
+    if history and history[-1].get("mode") == "ladder":
+        return ladder_cost_hit([c for c in history if c.get("mode") == "ladder"], p)
+    history = [c for c in history if c.get("mode") != "ladder"]   # each kind against its own rule
     window = max(p.cost_window, 1)
     recent = history[-window:]
     if not recent:
         return False, 0.0
     avg = cost_per_1000(sum(c["usd"] for c in recent), sum(c["paper"] for c in recent))
     return len(recent) >= window and avg > p.max_cost_per_1000, avg
+
+
+def ladder_cost_hit(periods: list[dict], p: Params) -> tuple[bool, float]:
+    """True when the last periods' average cost is above the cap by more than their own
+    scatter explains (LADDER_COST_Z standard errors)."""
+    recent = periods[-max(LADDER_COST_WINDOW, p.cost_window):]
+    if not recent:
+        return False, 0.0
+    avg = cost_per_1000(sum(c["usd"] for c in recent), sum(c["paper"] for c in recent))
+    if len(recent) < 3:
+        return False, avg
+    costs = [max(-50.0, min(50.0, cost_per_1000(c["usd"], c["paper"]) if c["usd"] > 0
+                            else c["usd"] / max(c["paper"], 1) * 1000)) for c in recent]
+    mean = sum(costs) / len(costs)
+    se = math.sqrt(sum((x - mean) ** 2 for x in costs) / (len(costs) - 1) / len(costs))
+    return avg - LADDER_COST_Z * se > p.max_cost_per_1000, avg

@@ -61,7 +61,7 @@ def test_one_wallet_mode_brings_b_over_and_keeps_both_legs_on_a(tmp_path):
     st = store.data
     assert st["totals"]["cycles"] == 1 and st["history"][0]["rearms"] == 3
     assert venue.max_positions <= 3                                 # partner leg never swept (old+new during a swap)
-    assert venue.calls["close", "A"] == 3 + 2
+    assert venue.calls["close", "A"] == 3 + 1                       # both legs of the reset in one Close
     assert venue.liquidations == 0
 
 
@@ -76,15 +76,19 @@ class RefuseReopens(FaultVenue):
         return super().open(w, coin, is_long, margin, leverage, deadline_s)
 
 
-def test_refused_reopens_end_the_period_without_a_naked_leg(tmp_path):
-    venue, store, bot = make(tmp_path, UP[:2], ladder(), venue_cls=RefuseReopens)
-    while store.data["totals"]["cycles"] == 0 and venue.now() - T0 < 400:
+def test_a_refused_reopen_keeps_the_old_leg_until_it_nears_liquidation(tmp_path):
+    points = UP[:2] + [(240, 100_400)]       # the short: -0.26% (refused re-opens), then -0.40%
+    venue, store, bot = make(tmp_path, points, ladder(), venue_cls=RefuseReopens)
+    seen = track_positions(venue)
+    run_until(bot, 230)
+    assert venue.calls["open", "B", "short"] > 1 + bot.t.rearm_attempts      # retried, never given up
+    assert len(venue.accounts["A"].positions) == 1 and len(venue.accounts["B"].positions) == 1   # still hedged
+    assert venue.calls["close", "B"] == 0 and len(seen["B"]) == 1
+    while store.data["totals"]["cycles"] == 0 and venue.now() - T0 < 600:
         bot.run(max_steps=1)
     st = store.data
-    assert venue.calls["open", "B", "short"] == 1 + bot.t.rearm_attempts
-    assert st["totals"]["cycles"] == 1 and st["cycles_all"][0]["rearms"] == 0
     assert st["cycles_all"][0]["kind"] == "cut" and not st["history"]      # outside the per-cycle cost cap
-    assert not venue.accounts["A"].positions and not venue.accounts["B"].positions   # the long was closed too
+    assert not venue.accounts["A"].positions and not venue.accounts["B"].positions and venue.liquidations == 0
 
 
 class CrashOnReopen(FaultVenue):
@@ -101,21 +105,22 @@ def SimVenue_open(venue, *args):
     return SimVenue.open(venue, *args)
 
 
-def test_crash_while_reopening_resumes_without_duplicates(tmp_path):
+def test_crash_while_reopening_keeps_the_old_leg_until_the_order_expires(tmp_path):
     venue, store, bot = make(tmp_path, UP[:2], ladder(), venue_cls=CrashOnReopen)
     seen = track_positions(venue)
     try:
         run_until(bot, 200)
     except KeyboardInterrupt:
         pass
-    assert store.data["phase"] == "rearming"
+    assert store.data["phase"] == "rearming" and venue.calls["close", "B"] == 0   # died before closing the old leg
     bot2 = Bot(venue, ladder(), StateStore(tmp_path / "state.json"), Timing())
     t = venue.now() - T0
-    run_until(bot2, t + bot2.t.open_deadline_s + 200)
-    c = bot2.st["cycle"]
-    assert bot2.st["phase"] == "open" and c["rearms"] == 1
-    assert len(venue.accounts["B"].positions) == 1 and len(seen["B"]) == 2
-    assert venue.max_positions <= 1 + 1
+    run_until(bot2, t + 200)                 # the re-open may still execute: the old short keeps hedging
+    assert venue.calls["close", "B"] == 0 and len(venue.accounts["B"].positions) == 1
+    run_until(bot2, t + 400)                 # it expired: re-armed again
+    st = bot2.st
+    assert st["phase"] == "open" and st["cycle"]["rearms"] == 1 and not st["cycles_all"]
+    assert len(seen["B"]) == 2 and venue.max_positions <= 2
 
 
 def test_rearm_stops_when_the_losing_wallet_cannot_afford_it(tmp_path):
@@ -211,7 +216,7 @@ def test_an_unreadable_balance_does_not_hold_back_the_losing_leg(tmp_path):
     assert venue.calls["close", "A"] == 2 and store.data["cycle"]["rearms"] == 2
 
 
-def test_a_period_cut_by_refusals_does_not_pause_the_farm(tmp_path):
+def test_a_short_open_interest_refusal_only_delays_the_rearm(tmp_path):
     class RefuseFor30s(FaultVenue):
         def open(self, w, coin, is_long, margin, leverage, deadline_s):
             if T0 + 59 <= self.clock < T0 + 89:
@@ -223,8 +228,58 @@ def test_a_period_cut_by_refusals_does_not_pause_the_farm(tmp_path):
     bot = Bot(venue, Params(), store, Timing())
     run_until(bot, 400)
     st = store.data
+    assert not st["cycles_all"] and st["phase"] == "open" and st["cycle"]["rearms"] == 1
+
+
+def test_a_cut_period_does_not_pause_the_farm(tmp_path):
+    venue = FaultVenue(Path([(0, 100_000), (60, 100_210)]), start_usdc=110.0, emission=18.9, min_notional=1000.0)
+    store = StateStore(tmp_path / "state.json")
+    bot = Bot(venue, Params(), store, Timing())
+    run_until(bot, 50)
+    venue.accounts["B"].usdc = 3.0           # the short's wallet cannot pay for its re-open
+    run_until(bot, 300)
+    st = store.data
     assert [c["kind"] for c in st["cycles_all"]] == ["cut"] and not st["history"]
-    assert not st.get("paused") and st["phase"] == "open"         # the next period is running
+    assert st["cycles_all"][0]["usd"] / st["cycles_all"][0]["paper"] * 1000 > 7     # expensive, as cut periods are
+    assert not st.get("paused")
+
+
+def test_the_old_leg_is_closed_only_once_its_replacement_is_accepted(tmp_path):
+    order = []
+
+    class Log(FaultVenue):
+        def open(self, w, coin, is_long, margin, leverage, deadline_s):
+            order.append(("open", "long" if is_long else "short"))
+            return super().open(w, coin, is_long, margin, leverage, deadline_s)
+
+        def close(self, w, ids):
+            order.append(("close", tuple(ids)))
+            return super().close(w, ids)
+
+    venue, store, bot = make(tmp_path, UP[:2], ladder(), venue_cls=Log)
+    run_until(bot, 120)
+    assert order[2:4] == [("open", "short"), ("close", (2,))]
+
+
+def test_a_new_leg_is_guarded_while_the_old_one_is_still_closing(tmp_path):
+    class SlowClose(FaultVenue):
+        """The old short stays listed for a while after its close (slow relayer or lagging stream)."""
+
+        def positions(self, w):
+            listed = super().positions(w)
+            return listed + [p for p in getattr(self, "ghosts", []) if self.clock < self.ghost_until]
+
+        def close(self, w, ids):
+            if w == "B" and ids == [2]:
+                self.ghosts = [p for p in super().positions(w) if p.id == 2]
+                self.ghost_until = self.clock + 60
+            return super().close(w, ids)
+
+    points = UP[:2] + [(70, 100_560)]        # 0.30% more against the short just re-opened at 100,260
+    venue, store, bot = make(tmp_path, points, ladder(), venue_cls=SlowClose)
+    while store.data["totals"]["cycles"] == 0 and venue.now() - T0 < 300:
+        bot.run(max_steps=1)
+    assert venue.liquidations == 0 and store.data["cycles_all"][0]["kind"] == "cut"
 
 
 def test_a_cycle_is_closed_before_its_session_keys_expire(tmp_path):
@@ -244,3 +299,90 @@ def test_a_cycle_is_closed_before_its_session_keys_expire(tmp_path):
     venue.expiry = venue.clock + 6 * 86400   # renewed
     run_until(bot, 2 * 86400 + 1100)
     assert st["phase"] in ("opening", "open")
+
+
+def test_the_other_leg_is_not_left_alone_when_a_reopen_never_executes(tmp_path):
+    for name, points, limit in (("retrace", UP[:2] + [(80, 100_000)], 100),   # gives back 0.26%: ended at once
+                                ("flat", UP[:2], 60 + Timing().rearm_naked_s + 15)):
+        venue, store, bot = make(tmp_path / name, points, ladder())
+        run_until(bot, 30)
+        venue.faults[("open", "B")] = {"never": True}    # accepted, then expires without executing
+        run_until(bot, limit)
+        assert not venue.accounts["A"].positions and not venue.accounts["B"].positions, name
+        assert store.data["cycle"]["cut"], name
+
+
+def test_slow_refused_reopens_still_end_the_period_before_liquidation(tmp_path):
+    class SlowAndRefused(RefuseReopens):
+        def usdc(self, w):
+            self.clock += 7                      # a slow HyperEVM read: each refused try outlasts the retry delay
+            return super().usdc(w)
+
+    points = [(0, 100_000)] + [(60 + 10 * i, 100_250 + 10 * i) for i in range(30)]   # slides against the short
+    venue, store, bot = make(tmp_path, points, ladder(), venue_cls=SlowAndRefused)
+    while store.data["totals"]["cycles"] == 0 and venue.now() - T0 < 600:
+        bot.run(max_steps=1)
+        venue.positions("B")
+    assert venue.liquidations == 0 and store.data["cycles_all"][0]["kind"] == "cut"
+
+
+def test_a_rearm_saved_by_the_previous_version_resumes(tmp_path):
+    points = UP[:2]
+    venue, store, bot = make(tmp_path, points, ladder(), venue_cls=FaultVenue)
+    venue.faults[("open", "B")] = {"delay": 6}
+    while store.data["phase"] != "rearming":
+        bot.run(max_steps=1)
+    st = store.data
+    for key in ("mid", "old_leg", "first_close_at"):   # what the previous version did not save
+        st["cycle"]["rearm"].pop(key, None)
+    st["schema"] = 3
+    store.save()
+    bot2 = Bot(venue, ladder(), StateStore(tmp_path / "state.json"), Timing())
+    run_until(bot2, 200)
+    assert bot2.st["phase"] == "open" and bot2.st["cycle"]["rearms"] == 1
+
+
+def test_one_wallet_waits_for_the_straddle_test_after_bringing_b_over(tmp_path):
+    venue, store, bot = make(tmp_path, [(0, 100_000)], ladder(one_wallet=True))
+    passed = []
+    bot.straddle_check = lambda: bool(passed)
+    run_until(bot, 900)
+    st = store.data
+    assert st["paused_kind"] == "straddle" and venue.accounts["B"].usdc < 1     # B's USDC is on A for the test
+    assert not venue.accounts["A"].positions
+    passed.append(True)                      # test done (bot restarted)
+    run_until(bot, 1000)
+    assert not st["paused"] and st["phase"] == "open"
+
+
+def test_a_classic_pair_keeps_the_state_readable_by_the_previous_version(tmp_path):
+    from . import x100
+    venue, store, bot = make(tmp_path, [(0, 100_000)], x100())
+    venue.mins = (10.0, 10_000.0)
+    store.data["schema"] = 3
+    run_until(bot, 100)
+    assert store.data["phase"] == "open" and store.data["schema"] == 3
+    venue2, store2, bot2 = make(tmp_path / "ladder", [(0, 100_000)], ladder())
+    store2.data["schema"] = 3
+    run_until(bot2, 100)
+    assert store2.data["schema"] == 4
+
+
+def test_a_reset_reached_during_a_rearm_is_a_normal_period(tmp_path):
+    class SlowClose(FaultVenue):
+        def positions(self, w):     # the old short stays listed a while after its close
+            listed = super().positions(w)
+            return listed + [p for p in getattr(self, "ghosts", []) if self.clock < self.ghost_until]
+
+        def close(self, w, ids):
+            if w == "B" and ids == [2]:
+                self.ghosts = [p for p in super().positions(w) if p.id == 2]
+                self.ghost_until = self.clock + 60
+            return super().close(w, ids)
+
+    points = UP[:2] + [(70, 101_010)]        # the long reaches +1% (the reset) while B is being re-armed
+    venue, store, bot = make(tmp_path, points, ladder(), venue_cls=SlowClose)
+    while store.data["totals"]["cycles"] == 0 and venue.now() - T0 < 300:
+        bot.run(max_steps=1)
+    st = store.data
+    assert st["cycles_all"][0]["kind"] == "normal" and st["history"]

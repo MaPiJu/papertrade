@@ -7,13 +7,14 @@ que de l'ampleur du mouvement sur lequel le gain est encaissé (formule vérifi�
 
 Deux stratégies :
 
-- **échelle (`STRATEGY=ladder`, par défaut)** : quand une jambe perd `LADDER_STEP_PCT` (0,25 %), le bot la ferme
-  (sa perte mint du PAPER) et la rouvre aussitôt au prix du moment, avec la même quantité de BTC que l'autre jambe.
-  L'autre jambe continue de courir. Quand une jambe gagne `LADDER_RESET_PCT` (calculé à partir de l'émission pour
-  rester sous le plafond de coût, ~2 % aujourd'hui), le bot ferme tout et recommence. Le PAPER est minté par petites
-  marches, et le gain, seul à subir la retenue, est encaissé sur un grand mouvement : même coût par PAPER que la
-  paire, mais des périodes environ deux fois plus courtes (elles s'arrêtent quand l'écart entre le plus haut et le
-  plus bas atteint ~2 %, pas quand le prix s'est éloigné de 2 % de son départ) ;
+- **échelle (`STRATEGY=ladder`, par défaut)** : quand une jambe perd `LADDER_STEP_PCT` (0,20 %), le bot rouvre
+  une position du même côté au prix du moment (même quantité de BTC que l'autre jambe) et ferme l'ancienne dès que
+  la nouvelle est acceptée : sa perte mint du PAPER. L'autre jambe continue de courir. Quand une jambe gagne
+  `LADDER_RESET_PCT` (calculé à partir de l'émission pour rester sous le plafond de coût, ~2 % aujourd'hui), le bot
+  ferme tout et recommence. Le PAPER est minté par petites marches, et le gain, seul à subir la retenue, est encaissé
+  sur un grand mouvement : même coût par PAPER qu'une paire fermée à ~2 %, mais des périodes ~1,7 fois plus
+  courtes (elles s'arrêtent quand l'écart entre le plus haut et le plus bas atteint ~2 %, pas quand le prix s'est
+  éloigné de 2 % de son départ) ;
 - **paire (`STRATEGY=pair`)** : le wallet A ouvre un long, le wallet B un short ; dès que le prix a bougé de
   `CLOSE_MOVE_PCT`, le bot ferme les deux jambes ;
 - **un seul wallet (`ONE_WALLET=true`, conseillé avec l'échelle et un petit capital)** : le long et le short vivent
@@ -21,31 +22,43 @@ Deux stratégies :
   jambe qui perd, d'où des positions environ deux fois plus grosses qu'avec deux wallets. Un test réel préalable
   (`--straddle`) vérifie que PaperTrade garde bien les deux positions séparées.
 
-Simulation du bot complet sur 72 h (BTC à 0,5 %/h de volatilité, émission 18,9 PAPER/$, ~109 $ au départ) :
+Deux simulateurs indépendants (latence réelle des ordres : ouverture ~5 s, fermeture 5 à 10 s ; 24 tirages de
+20 jours ; émission 18,9 PAPER/$ ; ~110 $ de capital) :
 
-| Stratégie | PAPER par jour | Coût pour 1 000 PAPER |
+| Stratégie | PAPER par jour (BTC à 0,35 / 0,5 / 0,7 %/h) | Coût pour 1 000 PAPER |
 |---|---|---|
-| paire x40, fermeture à ±2 % (deux wallets) | ~520 à 990 | 6,86 $ |
-| échelle, deux wallets | ~370 à 980 (bloquée sous ~43 $ par wallet) | ~6,9 $ |
-| échelle, un seul wallet | ~1 900 à 2 100 | ~6,8 $ |
+| paire x40, fermeture à ±2 % (deux wallets) | ~590 / 1 190 / 2 340 | 6,86 $ |
+| échelle, deux wallets | environ la moitié de la ligne suivante | ~6,85 $ |
+| échelle, un seul wallet (x200) | ~1 400 / 2 900 / 5 600 | ~6,85 $ |
+
+Le coût par PAPER est le même : l'échelle ne fabrique pas plus de PAPER par dollar, elle les fabrique plus vite
+(et dépense le capital plus vite, ~20 $/jour à 0,5 %/h). C'est utile parce que l'émission baisse avec le temps :
+le PAPER d'aujourd'hui est moins cher que celui de la semaine prochaine.
 
 Dans tous les cas :
 
-- **jamais de liquidation** : chaque jambe est fermée au moins `LIQ_SAFETY_PCT` (0,15 %) avant son prix de
-  liquidation ;
+- **liquidations évitées** : la paire est fermée au moins `LIQ_SAFETY_PCT` (0,15 %) avant la liquidation ; les jambes
+  de l'échelle se liquident `LADDER_LIQ_BUFFER_PCT` (0,25 %) au-delà de leur marche, assez pour la dizaine de
+  secondes d'une fermeture, même par forte volatilité (rares sauts de prix exceptés : une liquidation coûte alors
+  une marge, pas plus, l'autre jambe gagnant le même mouvement) ;
 - **staking automatique** : dès qu'un wallet détient 1 000 PAPER non stakés, le bot les stake, sans attendre de « go » ;
 - **rééquilibrage des USDC** (deux wallets) : après chaque cycle, le bot retire la moitié de l'écart du wallet riche
   vers HyperCore, puis l'envoie à l'adresse de dépôt PaperTrade de l'autre wallet ;
-- **arrêt automatique** : dès que le coût moyen des `COST_WINDOW` derniers cycles dépasse 7 $ pour 1 000 PAPER, le
-  bot arrête d'ouvrir des positions (l'émission baisse avec le temps), mais continue de staker. Le coût cumulé de
-  tous les cycles (avortés compris) est aussi surveillé. Un cycle écourté (réouverture refusée, solde insuffisant,
-  `close-cycle`, session key bientôt expirée) ne compte que dans ce cumul : encaissé sur un petit mouvement, il coûte
-  plus cher sans rien dire de la rentabilité du farming.
+- **arrêt automatique à 7 $ pour 1 000 PAPER** (le bot continue de staker) :
+  - *avant de payer* : un cycle n'est ouvert que si son coût prévu à l'émission du moment reste sous le plafond.
+    L'échelle choisit son seuil d'encaissement pour rester 2 % dessous ; quand l'émission aura baissé d'environ 5 %
+    (vers 18,0), plus aucun seuil ne convient et le farming s'arrête ;
+  - *après coup* : paire : moyenne des `COST_WINDOW` derniers cycles. Échelle : le coût réel d'une période varie
+    d'environ ±1 $/1 000 autour du coût prévu (les ordres ne s'exécutent pas à la même seconde ; en moyenne ça
+    s'annule), donc le bot s'arrête quand la moyenne des 20 dernières périodes dépasse le plafond nettement plus que
+    ce bruit (2,5 erreurs-types) : signe d'un vrai problème (frais changés, émission mal lue…) ;
+  - un cycle écourté (solde insuffisant, `close-cycle`, session key bientôt expirée…) ne compte que dans le coût
+    cumulé : encaissé sur un petit mouvement, il coûte plus cher sans rien dire de la rentabilité du farming.
 
 ```
 idle ──► (transfert B→A ou rééquilibrage) ──► ouverture long + short ──► surveillance du prix BBO Hyperliquid
-  ▲                                                                       │ échelle: perte ≥ 0,25 % → réarmement
-  │                                                                       │ (fermer + rouvrir la jambe perdante)
+  ▲                                                                       │ échelle: perte ≥ 0,20 % → réarmement
+  │                                                                       │ (rouvrir puis fermer la jambe perdante)
   └── stake du PAPER ◄── bilan (coût $, PAPER mintés) ◄── fermeture des 2 jambes ◄── gain ≥ ~2 % (échelle) ou
                                                                                      mouvement ≥ CLOSE_MOVE (paire)
 ```
@@ -62,8 +75,9 @@ idle ──► (transfert B→A ou rééquilibrage) ──► ouverture long + s
   et contourner le site « expose à une exclusion ». Le bot envoie les mêmes intents signés que le site, au même
   relayer, en s'identifiant honnêtement, mais c'est de l'automatisation : c'est votre risque.
 - **Capital et notionnel minimum.** Une position doit faire au moins 1 000 $ de notionnel et 10 $ de marge. L'échelle
-  dimensionne ses positions pour que la jambe qui perd puisse payer une période entière de marches ; sous ~43 $ par
-  wallet (deux wallets) ou ~55 $ (un wallet) elle n'est plus possible et le bot passe à la paire classique.
+  dimensionne ses positions pour que la jambe qui perd puisse payer une période entière de marches ; sous ~44 $ par
+  wallet (deux wallets) ou ~54 $ (un wallet) elle n'est plus possible et le bot passe à une paire fermée au même
+  seuil (même coût par PAPER), si elle reste sous le plafond.
 - **Retenue et frais vérifiés.** La jambe perdante perd exactement notionnel × mouvement (PAPER minté sur 98 % de la
   perte) ; la gagnante reçoit son gain après la retenue de la doc (« asymmetric impact ») et 2 % de frais. Les
   positions longues de plusieurs heures n'ont montré ni frais d'ouverture ni funding. Si la file d'attente des
@@ -72,8 +86,11 @@ idle ──► (transfert B→A ou rééquilibrage) ──► ouverture long + s
   actuelle est déjà basse, le plafond se déclenchera vite. `python -m ptbot plan` l'estime avant de lancer.
 - **Risques du protocole.** Contrats non vérifiés et upgradables, LP unique, profits mis en file d'attente si la
   LP manque de liquidités, PAPER non transférable pour l'instant. Un saut de prix plus grand que l'écart gardé avant la
-  liquidation (0,15 %) pendant la dizaine de secondes d'une fermeture liquide la jambe perdante (le bot le gère, mais
-  la période coûte plus cher).
+  liquidation (0,25 % pour l'échelle) pendant la dizaine de secondes d'une fermeture liquide la jambe perdante (le
+  bot le gère, la période coûte un peu plus cher ; on ne sait pas si une liquidation mint du PAPER).
+- **Volume auto-couvert.** Un long et un short sur le même compte, réarmés des dizaines de fois par jour, c'est la
+  signature du farming d'émission. Le site propose lui-même ce montage, mais si PaperTrade décidait d'exclure ce
+  volume, le PAPER gagné serait en jeu.
 - **Clés privées.** Le bot a besoin des clés des deux wallets : le staking et les retraits sont signés par le
   wallet principal. Utilisez deux wallets dédiés, ne mettez que ce que vous acceptez de perdre, gardez `.env` et
   `data/session_keys.json` pour vous.
@@ -136,22 +153,31 @@ pas conformes.
    `python tools/preflight_tiny_trade.py --wallet A` (à blanc), puis
    `python tools/preflight_tiny_trade.py --wallet A --i-understand-this-trades`, et pareil pour B (pas besoin de B
    avec `ONE_WALLET=true`). Toutes les lignes doivent être `PASS` ; notez les latences. Si l'ouverture met plus de
-   60 s, montez `OPEN_DEADLINE_S`. L'échelle ne garde que 0,15 % entre une marche et la liquidation : si la fermeture
-   met plus de 10 s, montez `LIQ_SAFETY_PCT` (le levier baisse d'autant) avant d'aller plus loin.
-   **Avec `ONE_WALLET=true`**, faites aussi le test long + short sur le même wallet (2 × 10 $) :
-   `python tools/preflight_tiny_trade.py --wallet A --straddle --i-understand-this-trades`. Il doit afficher
-   « long and short coexist as two positions on one wallet » en `PASS` ; sinon, restez sur deux wallets.
+   60 s, montez `OPEN_DEADLINE_S` (l'échelle attend alors une jambe rouverte jusqu'à la moitié de ce délai ; au-delà
+   d'une minute, préférez la paire). L'échelle garde 0,25 % entre une marche et la liquidation : si la fermeture met
+   plus de 15 s, montez `LADDER_LIQ_BUFFER_PCT` (le levier baisse d'autant) avant d'aller plus loin.
+   **Avec `ONE_WALLET=true`**, il faut aussi le test long + short sur le même wallet (2 × 10 $). Le bot vous le
+   demande lui-même (pause « test long + short … jamais fait ») après avoir transféré l'USDC de B sur A : arrêtez-le
+   (fichier `STOP`), lancez `python tools/preflight_tiny_trade.py --wallet A --straddle --i-understand-this-trades`,
+   qui doit afficher « long and short coexist as two positions on one wallet » en `PASS` (sinon, restez sur deux
+   wallets), puis relancez `run` : la pause se lève seule.
 9. **`python -m ptbot plan`** : stratégie, émission, taille des positions, marche et seuil d'encaissement, PAPER et
    coût attendus par période (formule vérifiée), comparés au plafond.
 10. **Premier lancement supervisé** dans `tmux` (le bot doit survivre à la fermeture du terminal) :
     `python -m ptbot run` et `tail -f data/bot.log`. Surveillez avec `python -m ptbot status` (pas avec le site).
-    Vérifiez « Paire ouverte », les lignes « je la ferme … et la rouvre » puis « Jambe … réarmée », l'absence de
-    « refusé », et le bilan de la première période (coût pour 1 000 PAPER proche de celui annoncé par `plan`).
+    Vérifiez « Paire ouverte », les lignes « je la rouvre et ferme l'ancienne » puis « Jambe … réarmée », l'absence
+    de « refusé », et le bilan de la première période (coût pour 1 000 PAPER à ±1 $ de celui annoncé par `plan`).
 11. **Laissez-le tourner seul après au moins 3 périodes propres** (coûts et PAPER cohérents avec le site).
     Refaites l'étape 2 après toute mise à jour de PaperTrade (contrats upgradables).
 
 **Changer de stratégie** : modifiez `.env` puis redémarrez le bot. Un cycle en cours se termine selon la stratégie
-avec laquelle il a été ouvert ; la nouvelle s'applique au suivant.
+avec laquelle il a été ouvert ; la nouvelle s'applique au suivant. Pour ne pas attendre sa fin : bot arrêté (fichier
+`STOP`), `python -m ptbot close-cycle` ferme le cycle comme le ferait le bot et le comptabilise.
+
+**Mise à jour depuis une version sans l'échelle** : un `.env` sans ligne `STRATEGY` garde la paire classique. Pour
+l'échelle sur un seul wallet : `STOP`, `git pull`, `python -m pytest -q`, ajoutez `STRATEGY=ladder` et
+`ONE_WALLET=true` dans `.env`, `python -m ptbot plan`, puis `python -m ptbot run` dans `tmux`. La paire ouverte se
+termine comme avant, le bot transfère l'USDC de B sur A, puis demande le test long + short (étape 8).
 
 **Procédure d'urgence** : créez le fichier `STOP`, attendez l'arrêt du bot, fermez les deux jambes (`close-all`,
 ou sur le site, puis `register` avant de relancer). `close-all` refuse de tourner pendant que le bot tourne.
@@ -167,6 +193,7 @@ ou sur le site, puis `register` avant de relancer). `close-all` refuse de tourne
 | `run` | lance le bot |
 | `status` | soldes, positions, PAPER générés, coût moyen |
 | `stake-now` | stake immédiatement tout le PAPER non staké |
+| `close-cycle` | ferme le cycle en cours comme le ferait le bot (comptabilisé), puis s'arrête ; bot arrêté |
 | `close-all` | ferme toutes les positions des deux wallets |
 | `resume` | lève une pause (`--reset-costs` oublie l'historique de coût) |
 
@@ -191,8 +218,9 @@ bot reprend le cycle en cours (`data/state.json`). Pour tout couper : `close-all
   si un retrait a expiré sans être exécuté ou si un envoi n'est jamais parti.
 
 `python -m ptbot resume` fonctionne aussi pendant que le bot tourne (il le prend en compte au tour suivant). Un
-`data/state.json` d'une version précédente du bot, laissé en plein cycle, est refusé au démarrage avec la marche à
-suivre.
+`data/state.json` de la version précédente (paires classiques) est repris tel quel, cycle en cours compris ; un
+fichier plus ancien laissé en plein cycle est refusé au démarrage avec la marche à suivre. Une fois qu'un cycle en
+échelle ou sur un seul wallet a été ouvert, la version précédente refuse ce fichier au lieu de mal le lire.
 
 **Pauses** : le bot se met en pause (et continue de staker) quand le plafond de coût est atteint, quand un
 rééquilibrage reste bloqué 2 h, après 3 paires ratées d'affilée, si une position reste listée après 8 tentatives de
@@ -206,25 +234,28 @@ le fausserait. `stake-now` refuse tant qu'un cycle est en cours ; arrêtez d'abo
 
 | Variable | Défaut | Rôle |
 |---|---|---|
-| `STRATEGY` | ladder | `ladder` (échelle) ou `pair` (paire classique) |
-| `ONE_WALLET` | false | long et short sur le wallet A, l'USDC de B y est transféré une fois (test `--straddle` requis) |
-| `LADDER_STEP_PCT` | 0.25 | échelle : perte à laquelle une jambe est fermée et rouverte (le levier en découle) |
+| `STRATEGY` | pair si absent | `ladder` (échelle, celle de `.env.example`) ou `pair` (paire classique) |
+| `ONE_WALLET` | false | long et short sur le wallet A, l'USDC de B y est transféré une fois (test `--straddle` requis) ; conseillé avec l'échelle |
+| `LADDER_STEP_PCT` | 0.20 | échelle : perte à laquelle une jambe est rouverte et l'ancienne fermée |
+| `LADDER_LIQ_BUFFER_PCT` | 0.25 | échelle : liquidation des jambes à cette distance au-delà de la marche (fixe leur levier : x200 par défaut) |
 | `LADDER_RESET_PCT` | 0 | échelle : gain qui termine la période ; 0 = calculé depuis l'émission pour rester 2 % sous le plafond |
 | `LADDER_MAX_LEVERAGE` | 1000 | échelle : levier maximum des jambes |
 | `LEVERAGE` / `MAX_LEVERAGE` | 250 / 250 | paire : levier visé / levier max autorisé pour rester au notionnel minimum |
 | `TARGET_NOTIONAL_USD` | 11000 | paire : marge par jambe = notionnel visé / levier (44 $ en x250) ; 0 = tout le solde |
 | `CLOSE_MOVE_PCT` | 0.70 | paire : mouvement de prix qui déclenche la fermeture des 2 jambes |
-| `LIQ_SAFETY_PCT` | 0.15 | écart minimum gardé avant la liquidation (borne `CLOSE_MOVE_PCT`, fixe le levier de l'échelle) |
+| `LIQ_SAFETY_PCT` | 0.15 | paire : écart minimum gardé avant la liquidation (borne `CLOSE_MOVE_PCT`) |
 | `MARGIN_FRACTION` / `MAX_MARGIN_USD` | 1.0 / 0 | marge par jambe = plus petit solde × fraction (plafonnée) |
 | `REBALANCE_THRESHOLD_PCT` / `MIN_REBALANCE_USD` | 10 / 11 | quand rééquilibrer (11 minimum : retraits et dépôts de 10 USDC, +1 USDC d'activation HyperCore au premier retrait) |
 | `STAKE_THRESHOLD_PAPER` | 1000 | seuil de staking automatique |
-| `MAX_COST_PER_1000_PAPER` / `COST_WINDOW` | 7 / 1 | arrêt dès qu'un cycle (ou la moyenne de N cycles) dépasse le plafond ; 3 conseillé avec l'échelle (le coût d'une période varie de quelques %) |
+| `MAX_COST_PER_1000_PAPER` / `COST_WINDOW` | 7 / 1 | plafond de coût ; paire : jugé sur la moyenne des N derniers cycles (l'échelle, elle, est jugée sur ses 20 dernières périodes, voir plus haut) |
 | `OPEN_DEADLINE_S` | 120 | durée de validité d'un ordre d'ouverture (à monter si le relayer est lent) |
 
 Le coût par PAPER ne dépend que du mouvement sur lequel le gain est encaissé (`CLOSE_MOVE_PCT` pour la paire,
 `LADDER_RESET_PCT` pour l'échelle) : plus il est grand, moins le PAPER coûte, mais plus les cycles sont longs. À
 l'émission 18,9 : 0,20 % → ~11 $/1 000, 0,70 % → ~7,8 $, 1 % → ~7,4 $, 2 % → ~6,9 $, 3 % → ~6,7 $, jamais moins de
-~6,4 $. Le pas de l'échelle (`LADDER_STEP_PCT`) ne change pas ce coût : il fixe le levier et la finesse des marches.
+~6,4 $. Le pas de l'échelle (`LADDER_STEP_PCT`) ne change pas ce coût : avec `LADDER_LIQ_BUFFER_PCT`, il fixe le
+levier (1 / (pas + écart + 0,05 %)) et la finesse des marches. Un pas plus petit donne un levier plus haut et un peu
+plus de PAPER par jour, mais plus d'ordres et un coût par période plus bruité.
 
 ## Comment ça marche techniquement
 
@@ -241,9 +272,14 @@ l'émission 18,9 : 0,20 % → ~11 $/1 000, 0,70 % → ~7,8 $, 1 % → ~7,4 $, 2 
   dépôt PaperTrade de l'autre wallet → le bot attend que le solde soit crédité.
 - **Coût d'un cycle** = (USDC + file d'attente) avant − après ; PAPER = solde PAPER après − avant. Pour l'échelle, le
   cycle est la période entière (tous les réarmements compris).
-- **Réarmement** : fermeture de l'ancienne position et ouverture de la nouvelle envoyées l'une après l'autre (la paire
-  reste couverte), nouvelle jambe de même quantité de BTC que l'autre ; la nouvelle position est reconnue à son sens,
-  sa marge et son levier, l'ancienne n'est oubliée qu'après 3 lectures sans elle.
+- **Réarmement** : ouverture de la nouvelle position, puis fermeture de l'ancienne dès que l'ouverture est acceptée
+  (la paire reste couverte ; une ouverture refusée, par exemple par le plafond d'open interest, laisse l'ancienne en
+  place et sera retentée, sauf si elle approche de sa liquidation). Nouvelle jambe de même quantité de BTC que
+  l'autre, reconnue à son sens, sa marge et son levier ; l'ancienne n'est oubliée qu'après 3 lectures sans elle.
+  Tant que la nouvelle n'est pas visible, l'autre jambe est protégée : la période est close si le prix revient d'une
+  marche contre elle ou 60 s (la moitié d'`OPEN_DEADLINE_S` si c'est plus) après la fermeture de l'ancienne. Après un arrêt entre l'ouverture et la fermeture,
+  l'ancienne jambe est gardée tant que l'ordre peut encore s'exécuter. Les deux jambes d'un même wallet sont fermées
+  par un seul ordre.
 - **Émission** : celle du site (`/query/protocol/summary`), à défaut les getters on-chain.
 
 Fichiers locaux : `data/bot.log` (journal), `data/state.json` (état et historique), `data/session_keys.json`

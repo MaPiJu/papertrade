@@ -75,6 +75,13 @@ def test_price_gap_through_liquidation_is_booked(tmp_path):
     assert not store.data.get("paused")
 
 
+class MisreadEmission(SimVenue):
+    """Plans with 25 PAPER/$ but mints 2: the realised cost is what catches it."""
+
+    def paper_emission(self):
+        return 25.0
+
+
 def test_cost_cap_pauses_farming_but_keeps_staking(tmp_path):
     params = x100(max_cost_per_1000=7, cost_window=2)
     points = [(0, 100_000)]
@@ -82,7 +89,7 @@ def test_cost_cap_pauses_farming_but_keeps_staking(tmp_path):
     for i in range(1, 12):                  # alternating 0.75% moves
         px = px * (1.0075 if i % 2 else 1 / 1.0075)
         points.append((i * 900, px))
-    venue, store, bot = make(tmp_path, points, usdc=300, emission=2, params=params)
+    venue, store, bot = make(tmp_path, points, usdc=300, emission=2, params=params, venue_cls=MisreadEmission)
     run_for(bot, 12 * 900)
     st = store.data
     assert st["paused"] and "plafond" in st["paused"]
@@ -155,3 +162,9 @@ def test_leg_executed_despite_error_is_adopted(tmp_path):
     run_for(bot, 30)
     assert store.data["phase"] == "open"
     assert len(venue.accounts["A"].positions) == 1 and len(venue.accounts["B"].positions) == 1
+
+
+def test_a_pair_the_emission_makes_too_expensive_is_not_opened(tmp_path):
+    venue, store, bot = make(tmp_path, [(0, 100_000)], usdc=150, emission=2)
+    run_for(bot, 120)
+    assert venue.accounts["A"].positions == {} and store.data["totals"]["cycles"] == 0

@@ -272,9 +272,11 @@ plus de PAPER par jour, mais plus d'ordres et un coût par période plus bruité
   dépôt PaperTrade de l'autre wallet → le bot attend que le solde soit crédité.
 - **Coût d'un cycle** = (USDC + file d'attente) avant − après ; PAPER = solde PAPER après − avant. Pour l'échelle, le
   cycle est la période entière (tous les réarmements compris).
-- **Réarmement** : ouverture de la nouvelle position, puis fermeture de l'ancienne dès que l'ouverture est acceptée
-  (la paire reste couverte ; une ouverture refusée, par exemple par le plafond d'open interest, laisse l'ancienne en
-  place et sera retentée, sauf si elle approche de sa liquidation). Nouvelle jambe de même quantité de BTC que
+- **Réarmement** : ouverture de la nouvelle position, puis fermeture de l'ancienne dès que la nouvelle existe. Quand
+  l'open interest est saturé, PaperTrade met les ouvertures en file d'attente pendant parfois plusieurs minutes :
+  l'ancienne jambe reste ouverte en attendant (la paire reste couverte) ; si elle approche de sa liquidation, la
+  période est close et l'ordre en attente annulé. Une ouverture refusée laisse aussi l'ancienne en place et sera
+  retentée. `OPEN_DEADLINE_S` borne l'attente dans la file (600 conseillé). Nouvelle jambe de même quantité de BTC que
   l'autre, reconnue à son sens, sa marge et son levier ; l'ancienne n'est oubliée qu'après 3 lectures sans elle.
   Tant que la nouvelle n'est pas visible, l'autre jambe est protégée : la période est close si le prix revient d'une
   marche contre elle ou 60 s (la moitié d'`OPEN_DEADLINE_S` si c'est plus) après la fermeture de l'ancienne. Après un arrêt entre l'ouverture et la fermeture,

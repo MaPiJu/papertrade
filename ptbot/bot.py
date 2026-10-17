@@ -665,9 +665,10 @@ class Bot:
         return False
 
     def _start_rearm(self, now: float, leg: str, mid: float) -> None:
-        """Re-opens the losing leg and closes the old one right after the new order is accepted:
-        both go out back to back, so the pair stays hedged, and a refused re-open (open-interest
-        cap) leaves the old leg in place, to be retried at the next checks."""
+        """Re-opens the losing leg and closes the old one only once the new position exists: an
+        accepted order can wait in PaperTrade's open-interest queue for minutes, and the old leg
+        keeps the pair hedged meanwhile. A refused re-open leaves the pair as it was, to be retried
+        at the next checks."""
         c = self.st["cycle"]
         d = c["legs"][leg]
         w = self._wallet(leg)
@@ -697,8 +698,7 @@ class Bot:
         if d["status"] == "rejected":
             self._undo_rearm(now)
             return
-        c.pop("rearm_refused", None)
-        self._rearm_close(now)
+        c.pop("rearm_refused", None)   # the old leg is closed by _rearming once the new one is seen
 
     def _undo_rearm(self, now: float) -> None:
         """The re-open was refused before anything changed: back to the pair as it was."""
@@ -803,7 +803,8 @@ class Bot:
         if listed is not None and d["pos_id"] is None:
             self._sync_legs(leg, listed, mid, now)
         if r["old_id"] is not None and not r["close_sends"]:
-            # Stopped between the re-open and the old leg's close: the old leg still hedges the pair.
+            # The new order is accepted but not seen yet (queued, or a restart): the old leg still
+            # hedges the pair, it is closed once the new one exists.
             waiting = d["status"] in MAYBE_EXECUTED and now < self.st["intents_valid_until"]
             if d["pos_id"] is not None:
                 self._rearm_close(now)
@@ -813,6 +814,10 @@ class Bot:
                     self._undo_rearm(now)
                     return
                 self._rearm_close(now)
+            elif now - r.get("queued_log", 0) >= 60:
+                r["queued_log"] = now
+                log.info("Jambe %s: réouverture acceptée mais pas encore exécutée (file d'attente ?), l'ancienne "
+                         "reste ouverte en attendant", leg)
         # From the old leg's close until the new one shows up, the other leg may be alone: bound that
         # time, and the gain it can give back meanwhile.
         if d["pos_id"] is None and r["close_sends"]:
@@ -838,6 +843,11 @@ class Bot:
                     return
                 old_adverse = (1 - mid / r["old_entry"]) if IS_LONG[leg] else (mid / r["old_entry"] - 1)
                 urgent = old_adverse >= (c["close_move"] + liq_distance(c["leverage"])) / 2
+                if urgent and not r["close_sends"] and d["pos_id"] is None:
+                    # Halfway to its liquidation and still no replacement: close everything, and cancel
+                    # the waiting order (a late fill is closed with the period).
+                    self._end_period(now, f"jambe {leg} à {-old_adverse:.3%} et réouverture toujours en attente")
+                    return
                 if urgent or (r["close_sends"] and now - r["close_sent_at"] >= self.t.close_retry_s):
                     self._rearm_close(now)
             else:

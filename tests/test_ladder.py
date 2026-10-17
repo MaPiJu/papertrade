@@ -301,15 +301,37 @@ def test_a_cycle_is_closed_before_its_session_keys_expire(tmp_path):
     assert st["phase"] in ("opening", "open")
 
 
-def test_the_other_leg_is_not_left_alone_when_a_reopen_never_executes(tmp_path):
-    for name, points, limit in (("retrace", UP[:2] + [(80, 100_000)], 100),   # gives back 0.26%: ended at once
-                                ("flat", UP[:2], 60 + Timing().rearm_naked_s + 15)):
+def test_a_queued_reopen_keeps_the_old_leg_so_the_pair_stays_hedged(tmp_path):
+    for name, points in (("retrace", UP[:2] + [(80, 100_000)]), ("flat", UP[:2])):
         venue, store, bot = make(tmp_path / name, points, ladder())
         run_until(bot, 30)
-        venue.faults[("open", "B")] = {"never": True}    # accepted, then expires without executing
-        run_until(bot, limit)
-        assert not venue.accounts["A"].positions and not venue.accounts["B"].positions, name
-        assert store.data["cycle"]["cut"], name
+        venue.faults[("open", "B")] = {"never": True}    # accepted, waits in PaperTrade's queue, never fills
+        run_until(bot, 200)
+        assert len(venue.accounts["A"].positions) == 1 and len(venue.accounts["B"].positions) == 1, name
+        assert venue.calls["close", "B"] == 0 and not store.data["cycles_all"], name   # hedged, nothing cut
+
+
+def test_a_reopen_filled_late_from_the_queue_completes_the_rearm(tmp_path):
+    venue, store, bot = make(tmp_path, UP[:2], ladder())
+    run_until(bot, 30)
+    venue.faults[("open", "B")] = {"delay": 90}         # the re-open waits 90 s in the queue
+    run_until(bot, 140)
+    assert venue.calls["close", "B"] == 0 and store.data["phase"] == "rearming"
+    run_until(bot, 220)
+    st = store.data
+    assert st["phase"] == "open" and st["cycle"]["rearms"] == 1 and venue.calls["close", "B"] == 1
+    assert len(venue.accounts["B"].positions) == 1 and not st["cycles_all"]
+
+
+def test_a_queued_reopen_ends_the_period_before_the_old_leg_nears_liquidation(tmp_path):
+    points = UP[:2] + [(120, 100_400)]       # the short at -0.40%, past halfway to its liquidation (0.50%)
+    venue, store, bot = make(tmp_path, points, ladder())
+    run_until(bot, 30)
+    venue.faults[("open", "B")] = {"never": True}
+    while store.data["totals"]["cycles"] == 0 and venue.now() - T0 < 500:
+        bot.run(max_steps=1)
+    assert store.data["cycles_all"][0]["kind"] == "cut" and venue.liquidations == 0
+    assert not venue.accounts["A"].positions and not venue.accounts["B"].positions
 
 
 def test_slow_refused_reopens_still_end_the_period_before_liquidation(tmp_path):

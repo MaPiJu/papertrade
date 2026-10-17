@@ -301,7 +301,9 @@ def cmd_run(settings, args) -> None:
         print("--force: démarrage malgré tout, à vos risques")
     if not args.yes:
         print("Le bot va trader de vrais fonds sur PaperTrade avec les deux wallets du fichier .env.")
-        if input("Tapez OUI pour continuer: ").strip().upper() != "OUI":
+        answer = input("Tapez OUI pour continuer: ").strip().upper()
+        if answer != "OUI":
+            print(f"Réponse {answer!r} au lieu de OUI: rien n'est lancé (tapez OUI après la question, ou `run --yes`).")
             return
     store = StateStore(settings.state_dir / "state.json")
     p = settings.params

@@ -1,7 +1,7 @@
 """Hyperliquid (HyperCore): BBO mid prices, USDC balances and transfers.
 
 PaperTrade opens and closes at the Hyperliquid BBO mid, so the bot watches the
-same price. Transfers (spotSend, usdClassTransfer) go through the official
+same price. Transfers (sendAsset, spotSend, usdClassTransfer) go through the official
 hyperliquid-python-sdk, which handles the signing.
 """
 from __future__ import annotations
@@ -66,7 +66,14 @@ class HyperliquidTransfers:
             raise RuntimeError(f"Hyperliquid a refusé l'action: {resp}")
 
     def spot_send_usdc(self, destination: str, amount: float) -> None:
-        self._check(self._exchange().spot_transfer(round(amount, 2), destination, HL_USDC_TOKEN))
+        """sendAsset from spot to spot, as the website's deposit does: an account in Hyperliquid's
+        unified mode refuses spotSend ("Action disabled when unified account is active")."""
+        ex = self._exchange()
+        resp = ex.send_asset(destination, "spot", "spot", HL_USDC_TOKEN, round(amount, 2))
+        if isinstance(resp, dict) and resp.get("status") == "ok":
+            return
+        log.warning("Hyperliquid a refusé sendAsset (%s): essai en spotSend", resp)
+        self._check(ex.spot_transfer(round(amount, 2), destination, HL_USDC_TOKEN))
 
     def perp_to_spot(self, amount: float) -> None:
         self._check(self._exchange().usd_class_transfer(round(amount, 2), to_perp=False))

@@ -209,3 +209,28 @@ def test_eip712_domain_absent_vs_unreachable(monkeypatch):
     evm.call_raw = down
     with pytest.raises(RuntimeError):            # never fall back to a guessed domain because the RPC was down
         evm.eip712_domain("0x" + "11" * 20)
+
+
+def test_hypercore_sends_use_send_asset_and_fall_back_to_spot_send():
+    from ptbot.constants import HL_USDC_TOKEN
+    from ptbot.hyperliquid import HyperliquidTransfers
+
+    class Exchange:
+        def __init__(self, send_asset_reply):
+            self.calls, self.reply = [], send_asset_reply
+
+        def send_asset(self, destination, source_dex, destination_dex, token, amount):
+            self.calls.append(("sendAsset", destination, source_dex, destination_dex, token, amount))
+            return self.reply
+
+        def spot_transfer(self, amount, destination, token):
+            self.calls.append(("spotSend", destination, amount))
+            return {"status": "ok"}
+
+    t = HyperliquidTransfers("0x" + "11" * 32, "https://api.hyperliquid.xyz")
+    t._ex = Exchange({"status": "ok", "response": {"type": "default"}})
+    t.spot_send_usdc("0xdep", 15.0)
+    assert t._ex.calls == [("sendAsset", "0xdep", "spot", "spot", HL_USDC_TOKEN, 15.0)]   # unified accounts
+    t._ex = Exchange({"status": "err", "response": "unknown action"})
+    t.spot_send_usdc("0xdep", 15.0)
+    assert [c[0] for c in t._ex.calls] == ["sendAsset", "spotSend"]

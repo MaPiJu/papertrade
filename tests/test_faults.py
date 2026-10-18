@@ -492,12 +492,16 @@ def test_pending_orders_are_cancelled_when_a_pair_is_abandoned(tmp_path):
     assert cancelled == [("B", "accepted")]
 
 
-def test_orders_that_never_execute_pause_at_once(tmp_path):
+def test_orders_that_never_execute_are_retried_later_then_pause(tmp_path):
     venue, store, bot = make(tmp_path, [(0, 100_000)],
                              {("open", "A"): {"never": True}, ("open", "B"): {"never": True}})
     run_for(bot, 300)
-    assert store.data["paused"] and "jamais exécutés" in store.data["paused"]
-    assert venue.calls["open", "A"] == 1
+    assert not store.data["paused"] and venue.calls["open", "A"] == 1   # PaperTrade's queue may be full
+    run_for(bot, 900)
+    assert venue.calls["open", "A"] == 2 and not store.data["paused"]
+    run_for(bot, 6000)
+    assert store.data["paused"] and "jamais exécutées" in store.data["paused"]
+    assert venue.calls["open", "A"] == bot.t.unfilled_pause_after
 
 
 def test_oldest_first_feed_is_followed_to_its_end_and_cached():

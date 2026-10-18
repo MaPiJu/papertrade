@@ -223,7 +223,9 @@ fichier plus ancien laissé en plein cycle est refusé au démarrage avec la mar
 échelle ou sur un seul wallet a été ouvert, la version précédente refuse ce fichier au lieu de mal le lire.
 
 **Pauses** : le bot se met en pause (et continue de staker) quand le plafond de coût est atteint, quand un
-rééquilibrage reste bloqué 2 h, après 3 paires ratées d'affilée, si une position reste listée après 8 tentatives de
+rééquilibrage reste bloqué 2 h, après 3 paires ratées d'affilée, après 6 ouvertures d'affilée acceptées mais jamais
+exécutées (PaperTrade met les ouvertures en file d'attente quand l'open interest est plein : le bot réessaie toutes
+les 10 min avant d'en arriver là), si une position reste listée après 8 tentatives de
 fermeture (cette pause se lève d'elle-même si la position finit par disparaître), ou si les soldes bougent alors que
 l'API ne montre aucune position. Le motif est dans `data/bot.log`. Corrigez, puis `python -m ptbot resume`.
 

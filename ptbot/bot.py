@@ -82,6 +82,8 @@ class Timing:
     heartbeat_s: float = 60.0
     rearm_attempts: int = 3          # ladder: re-opens of a leg before ending the period
     rearm_retry_s: float = 8.0
+    unfilled_retry_s: float = 600.0  # orders accepted but never filled (PaperTrade's queue full): retry after
+    unfilled_pause_after: int = 6    # ...and pause after this many in a row
     rearm_naked_s: float = 60.0      # ladder: longest wait for a re-opened leg after the old one's close
                                      # (half of open_deadline_s when that is longer)
 
@@ -528,6 +530,7 @@ class Bot:
         found = [leg for leg in LEGS if c["legs"][leg]["pos_id"] is not None]
         if len(found) == len(LEGS):
             self.st["open_failures"] = 0
+            self.st["unfilled_opens"] = 0
             c["next_poll"] = now + self.t.positions_every_s
             c["heartbeat"] = now
             self.st["phase"] = "open"
@@ -560,10 +563,18 @@ class Bot:
             self.pause("les soldes ont baissé mais aucune position n'est visible via l'API: des positions "
                        "sont sans doute ouvertes. Vérifiez sur le site et lancez `python -m ptbot probe`")
             return
-        # Accepted orders that never execute are abnormal (relayer queue, refused size or leverage,
-        # or positions the bot cannot see): stop at the first occurrence.
-        self.pause("ordres acceptés mais jamais exécutés avant leur échéance: vérifiez sur le site "
-                   "(file d'attente du relayer ? positions invisibles ?) puis `resume`")
+        # Nothing left the balances: the orders really did not fill. PaperTrade queues new positions
+        # while open interest is full, so try again later; many in a row is abnormal (refused size or
+        # leverage, positions the bot cannot see): stop then.
+        unfilled = self.st["unfilled_opens"] = self.st.get("unfilled_opens", 0) + 1
+        if unfilled >= self.t.unfilled_pause_after:
+            self.pause(f"{unfilled} ouvertures d'affilée acceptées mais jamais exécutées avant leur échéance: vérifiez "
+                       "sur le site (file d'attente pleine ? positions invisibles ?) puis `resume`")
+            return
+        self.st["next_try"] = now + self.t.unfilled_retry_s
+        log.warning("Ordres acceptés mais pas exécutés avant leur échéance (file d'attente de PaperTrade pleine ?): "
+                    "nouvel essai dans %.0f min (%d/%d)", self.t.unfilled_retry_s / 60, unfilled,
+                    self.t.unfilled_pause_after)
 
     def _abort(self, now: float, wallets: list[str]) -> None:
         self.st["cycle"]["aborted"] = True

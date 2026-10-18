@@ -174,10 +174,13 @@ class Bot:
                 try:
                     self.step()
                     errors = 0
-                except Exception:
+                except Exception as e:
                     errors += 1
                     self.store.save()
-                    log.exception("Erreur pendant le cycle (nouvel essai au prochain tour)")
+                    if isinstance(e, OSError):   # timeouts, refused connections (requests' errors are OSErrors)
+                        log.warning("API injoignable ou trop lente (%s): nouvel essai au prochain tour", e)
+                    else:
+                        log.exception("Erreur pendant le cycle (nouvel essai au prochain tour)")
                     # back off while an API is down, but keep watching the price while positions may be open
                     exposed = self.st["phase"] in ("opening", "open", "closing", "rearming")
                     self.v.sleep(min(2 * errors, 6) if exposed else min(5 * errors, 60))

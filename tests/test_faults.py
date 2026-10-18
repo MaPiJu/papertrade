@@ -134,12 +134,14 @@ def test_lost_response_on_b_waits_for_the_late_fill_instead_of_closing_a(tmp_pat
     assert venue.calls["close", "A"] == 0
 
 
-def test_order_that_never_executes_closes_the_lone_leg_and_never_stacks(tmp_path):
+def test_an_order_that_never_executes_goes_first_next_time_and_never_stacks(tmp_path):
     venue, store, bot = make(tmp_path, [(0, 100_000)], {("open", "B"): {"never": True}}, usdc=250)
     run_for(bot, 1200)
-    assert venue.max_positions <= 1
-    assert venue.calls["close", "A"] >= 1
-    assert store.data["paused"] and "3 paires ratées" in store.data["paused"]
+    assert venue.max_positions <= 1 and venue.calls["close", "A"] >= 1   # the lone A leg was closed
+    assert store.data["open_first"] == "B" and venue.calls["open", "A"] == 1   # then B waits alone: A not exposed
+    assert venue.calls["open", "B"] >= 2
+    run_for(bot, 6000)
+    assert store.data["paused"] and "jamais exécutées" in store.data["paused"]
 
 
 def test_lone_leg_is_closed_at_its_exit_before_the_deadline(tmp_path):
@@ -213,8 +215,10 @@ def test_slow_transfers_complete_without_pause(tmp_path):
 def test_crash_between_open_and_save_resumes_and_closes_the_lone_leg(tmp_path):
     venue, store, bot = make(tmp_path, [(0, 100_000)], {("open", "B"): {"crash": True}}, usdc=150)
     with pytest.raises(KeyboardInterrupt):
-        bot.step()
-    assert len(venue.accounts["A"].positions) == 1
+        for _ in range(50):       # A goes first; B is sent once A is seen
+            bot.step()
+            venue.sleep(2)
+    assert len(venue.accounts["A"].positions) == 1 and store.data["cycle"]["legs"]["B"]["status"] == "pending"
     venue.faults = {}
     bot2 = Bot(venue, x100(), StateStore(tmp_path / "state.json"), Timing())
     run_for(bot2, 330)  # B may have been signed late: the lone A leg is price-watched until B's order expires
@@ -543,3 +547,12 @@ def test_first_withdrawal_activation_fee_still_counts_as_arrived():
     assert _arrived(10.32, 11.32)            # 1 USDC HyperCore activation on a wallet's first withdrawal
     assert not _arrived(9.0, 11.32)
     assert not _arrived(0, 11.32)
+
+
+def test_legs_are_opened_one_at_a_time(tmp_path):
+    venue, store, bot = make(tmp_path, [(0, 100_000)], {("open", "A"): {"delay": 40}}, usdc=150)
+    run_for(bot, 30)
+    assert venue.calls["open", "A"] == 1 and venue.calls["open", "B"] == 0   # A waits (queued): B not exposed
+    run_for(bot, 30)
+    assert venue.calls["open", "B"] == 1 and store.data["phase"] == "open"
+    assert len(venue.accounts["A"].positions) == 1 and len(venue.accounts["B"].positions) == 1

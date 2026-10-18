@@ -274,6 +274,9 @@ plus de PAPER par jour, mais plus d'ordres et un coût par période plus bruité
   dépôt PaperTrade de l'autre wallet → le bot attend que le solde soit crédité.
 - **Coût d'un cycle** = (USDC + file d'attente) avant − après ; PAPER = solde PAPER après − avant. Pour l'échelle, le
   cycle est la période entière (tous les réarmements compris).
+- **Ouverture d'une période** : une jambe à la fois. Celle qui a attendu dans la file de PaperTrade la dernière
+  fois part en premier, seule (rien n'est exposé pendant qu'elle attend) ; l'autre est envoyée dès qu'elle est
+  exécutée.
 - **Réarmement** : ouverture de la nouvelle position, puis fermeture de l'ancienne dès que la nouvelle existe. Quand
   l'open interest est saturé, PaperTrade met les ouvertures en file d'attente pendant parfois plusieurs minutes :
   l'ancienne jambe reste ouverte en attendant (la paire reste couverte) ; si elle approche de sa liquidation, la

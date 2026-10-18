@@ -421,35 +421,40 @@ class Bot:
         self.st["phase"] = "opening"
         if cycle["mode"] == "ladder" or self.p.one_wallet:
             self.st["schema"] = SCHEMA   # the previous version would misread this cycle: it now refuses the file
-        self.st["intents_valid_until"] = cycle["deadline"] + self.t.indexer_slack_s
-        self.store.save()  # write-ahead: a crash during the requests below resumes in 'opening'
-        # After an open-interest refusal, start with the other side: it lowers the net open interest.
+        # One leg at a time: PaperTrade can keep an open in its queue for minutes while open interest is
+        # full. The side that last waited (or the other side after an open-interest refusal) goes first,
+        # alone, so nothing is exposed while it waits; the other follows once it is filled.
         order = ("B", "A") if self.st.get("open_first") == "B" else LEGS
-        for name in order:
-            leg = cycle["legs"][name]
-            try:
-                leg["intent"] = self.v.open(self._wallet(name), coin, IS_LONG[name], plan.margin, plan.leverage,
-                                            self.t.open_deadline_s)
-                leg["status"] = "sent"
-            except IntentRejected as e:
-                leg["status"] = "rejected"
-                log.error("Ouverture refusée sur %s: %s", name, e)
-                if "openInterest" in str(e):
-                    self.st["open_first"] = "B" if name == "A" else "A"
-                break  # no point opening the other leg alone
-            except Exception as e:
-                leg["status"] = "unknown"
-                log.warning("Ouverture sur %s: pas de réponse claire (%s). L'ordre a peut-être été exécuté, je surveille",
-                            name, e)
-        for leg in cycle["legs"].values():
-            if leg["status"] == "pending":
-                leg["status"] = "not_sent"
-        # Every order was signed before now, so none can execute after now + its lifetime.
-        cycle["deadline"] = self.v.now() + self.t.open_deadline_s
-        live = any(leg["status"] in MAYBE_EXECUTED for leg in cycle["legs"].values())
-        self.st["intents_valid_until"] = cycle["deadline"] + self.t.indexer_slack_s if live else now
-        if any(leg["status"] == "rejected" for leg in cycle["legs"].values()):
+        cycle["second"] = order[1]
+        cycle["legs"][order[1]]["status"] = "not_sent"
+        self.st["intents_valid_until"] = cycle["deadline"] + self.t.indexer_slack_s
+        self.store.save()  # write-ahead: a crash during the request below resumes in 'opening'
+        self._send_open(cycle, order[0])
+        if cycle["legs"][order[0]]["status"] == "rejected":
             self._open_failed(cycle, "ouverture refusée")
+
+    def _send_open(self, c: dict, name: str) -> None:
+        leg = c["legs"][name]
+        try:
+            leg["intent"] = self.v.open(self._wallet(name), c["coin"], IS_LONG[name], c["margin"], c["leverage"],
+                                        self.t.open_deadline_s)
+            leg["status"] = "sent"
+        except IntentRejected as e:
+            leg["status"] = "rejected"
+            log.error("Ouverture refusée sur %s: %s", name, e)
+            if "openInterest" in str(e):   # the other side lowers the net open interest: start with it
+                self.st["open_first"] = "B" if name == "A" else "A"
+        except Exception as e:
+            leg["status"] = "unknown"
+            log.warning("Ouverture sur %s: pas de réponse claire (%s). L'ordre a peut-être été exécuté, je surveille",
+                        name, e)
+        # Every order was signed before now, so none can execute after now + its lifetime.
+        now = self.v.now()
+        if leg["status"] in MAYBE_EXECUTED:
+            c["deadline"] = now + self.t.open_deadline_s
+            self.st["intents_valid_until"] = max(self.st["intents_valid_until"], c["deadline"] + self.t.indexer_slack_s)
+        elif not any(c["legs"][n]["status"] in MAYBE_EXECUTED and c["legs"][n]["pos_id"] is None for n in LEGS):
+            self.st["intents_valid_until"] = min(self.st["intents_valid_until"], now)
 
     def _open_failed(self, c: dict, what: str) -> None:
         if c.get("failure_counted"):
@@ -528,6 +533,18 @@ class Bot:
                 return
         self._sync_and_sweep(self._read_cycle_wallets(), mid, now)
         found = [leg for leg in LEGS if c["legs"][leg]["pos_id"] is not None]
+        second = c.get("second")
+        if second and c["legs"][second]["status"] == "not_sent" and found and second not in found and not c["aborted"]:
+            log.info("Jambe %s exécutée: j'ouvre la jambe %s", found[0], second)
+            c["legs"][second]["status"] = "pending"
+            self.st["intents_valid_until"] = max(self.st["intents_valid_until"], now + self.t.open_deadline_s
+                                                 + self.t.submit_margin_s + self.t.indexer_slack_s)
+            self.store.save()   # write-ahead: a crash during the request watches for this order, never resends it
+            self._send_open(c, second)
+            if c["legs"][second]["status"] == "rejected":
+                self._abort(now, found)
+                self._open_failed(c, "ouverture refusée")
+            return
         if len(found) == len(LEGS):
             self.st["open_failures"] = 0
             self.st["unfilled_opens"] = 0
@@ -549,6 +566,8 @@ class Bot:
             log.warning("Une seule jambe ouverte (%s): je la ferme pour rester neutre", found)
             self._abort(now, found)
             if waiting:
+                # It waited in PaperTrade's queue: next time it goes first, alone, until it is filled.
+                self.st["open_first"] = waiting[0]
                 self._open_failed(c, "une jambe jamais exécutée")
             return
         if not waiting:  # every leg was refused outright (already counted)

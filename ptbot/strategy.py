@@ -7,7 +7,8 @@ Cycle (rusk0f's method):
   3. the losing leg's realised loss mints PAPER; the winning leg brings back
      most of the move (minus PaperTrade's haircut on profits);
   4. USDC is rebalanced between A and B, PAPER is staked, and the next cycle starts.
-Farming stops once a cycle costs more than `max_cost_per_1000` USD per 1,000 PAPER.
+Farming stops once the USDC left is at or under `min_balance_usd`, or once a cycle costs more
+than `max_cost_per_1000` USD per 1,000 PAPER (each rule off at 0).
 """
 from __future__ import annotations
 
@@ -30,8 +31,9 @@ class Params:
     rebalance_threshold: float = 0.10  # rebalance when |A-B| / (A+B) exceeds this
     min_rebalance_usd: float = 11.0    # never below MIN_CORE_TRANSFER_USD
     stake_threshold: float = 1000.0    # stake as soon as a wallet holds this much unstaked PAPER
-    max_cost_per_1000: float = 7.0     # USD per 1,000 PAPER above which farming stops
+    max_cost_per_1000: float = 7.0     # USD per 1,000 PAPER above which farming stops (0 = no cost cap)
     cost_window: int = 1               # cycles averaged for the cost cap (1 = rusk0f's per-cycle rule)
+    min_balance_usd: float = 0.0       # farming stops once the USDC left is at or under this (0 = never)
     strategy: str = "ladder"           # "ladder" (re-arm the losing leg) or "pair" (close both together)
     ladder_step: float = 0.002         # ladder: the losing leg is closed and re-opened after this move
     ladder_liq_buffer: float = 0.0025  # ladder legs: liquidation this far beyond the step (sets their leverage)
@@ -129,13 +131,19 @@ def plan_open(bal_a: float, bal_b: float, min_margin: float, min_notional: float
 
 
 MAX_LADDER_RESET = 0.06
+# Without a cost cap, the move the automatic reset chose at launch (emission 18.9, cap 7$): a larger
+# one costs a little less per PAPER but makes the periods, and the farming, much slower.
+NO_CAP_LADDER_RESET = 0.02
 
 
 def ladder_reset_move(emission: float | None, p: Params) -> float | None:
-    """Winner's gain that ends a ladder period: fixed, or the smallest move whose cost per 1000
-    PAPER stays under the cap with a margin (the cost falls as the realised move grows)."""
+    """Winner's gain that ends a ladder period: fixed, 2% without a cost cap, or the smallest move
+    whose cost per 1000 PAPER stays under the cap with a margin (the cost falls as the realised
+    move grows)."""
     if p.ladder_reset > 0:
         return p.ladder_reset
+    if p.max_cost_per_1000 <= 0:
+        return NO_CAP_LADDER_RESET
     if not emission or emission <= 0:
         return None
     target = p.max_cost_per_1000 * (1 - p.ladder_cost_margin)
@@ -159,7 +167,7 @@ def plan_ladder(free: dict[str, float], min_margin: float, min_notional: float, 
         return Skip(f"{what}: même en laissant le gagnant courir jusqu'à {MAX_LADDER_RESET:.0%}, le coût "
                     f"dépasserait {p.max_cost_per_1000:.2f}$/1000 PAPER")
     cost = cost_per_1000_at(reset, emission, p.coin) if emission else None
-    if p.ladder_reset > 0 and cost is not None and cost > p.max_cost_per_1000:
+    if p.ladder_reset > 0 and p.max_cost_per_1000 > 0 and cost is not None and cost > p.max_cost_per_1000:
         return Skip(f"encaissement à +{reset:.2%} (LADDER_RESET_PCT): coût prévu {cost:.2f}$/1000 PAPER à l'émission "
                     f"actuelle ({emission:.2f}) > plafond {p.max_cost_per_1000:.2f}$ (MAX_COST_PER_1000_PAPER)")
     step = p.ladder_step
@@ -213,7 +221,7 @@ def choose_plan(bal: dict[str, float], min_margin: float, min_notional: float, e
     if isinstance(plan, Skip) and pair_p is not p:
         plan = Skip(f"paire de repli limitée à x{pair_p.leverage} pour fermer à ±{pair_p.close_move:.2%} (coût d'une "
                     f"période): {plan.reason.split(':')[0]}; rechargez le wallet")
-    if isinstance(plan, OpenPlan) and emission:
+    if isinstance(plan, OpenPlan) and emission and p.max_cost_per_1000 > 0:
         cost = cost_per_1000_at(plan.close_move, emission, p.coin)
         if cost > p.max_cost_per_1000:
             plan = Skip(f"paire x{plan.leverage} fermée à ±{plan.close_move:.2%}: coût prévu {cost:.2f}$/1000 PAPER "

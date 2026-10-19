@@ -82,18 +82,40 @@ class MisreadEmission(SimVenue):
         return 25.0
 
 
-def test_cost_cap_pauses_farming_but_keeps_staking(tmp_path):
-    params = x100(max_cost_per_1000=7, cost_window=2)
+def alternating_moves():
+    """0.75% up, 0.75% down, ... every 15 minutes."""
     points = [(0, 100_000)]
     px = 100_000
-    for i in range(1, 12):                  # alternating 0.75% moves
+    for i in range(1, 12):
         px = px * (1.0075 if i % 2 else 1 / 1.0075)
         points.append((i * 900, px))
+    return points
+
+
+def test_cost_cap_pauses_farming_but_keeps_staking(tmp_path):
+    params = x100(max_cost_per_1000=7, cost_window=2)
+    points = alternating_moves()
     venue, store, bot = make(tmp_path, points, usdc=300, emission=2, params=params, venue_cls=MisreadEmission)
     run_for(bot, 12 * 900)
     st = store.data
     assert st["paused"] and "plafond" in st["paused"]
     assert len(st["history"]) == 2
+    venue.accounts["A"].paper_raw = 5000 * SCALE
+    run_for(bot, 120)
+    assert venue.accounts["A"].staked_raw >= 5000 * SCALE
+    assert st["totals"]["cycles"] == 2      # no new cycle while paused
+
+
+def test_without_a_cost_cap_the_balance_floor_stops_farming(tmp_path):
+    # PAPER at ~70$/1000 (emission 2): far above any cap, yet farmed until both wallets hold 270$ or less.
+    params = x100(max_cost_per_1000=0, min_balance_usd=270)
+    venue, store, bot = make(tmp_path, alternating_moves(), usdc=150, emission=2, params=params)
+    run_for(bot, 12 * 900)
+    st = store.data
+    assert st["totals"]["cycles"] == 2      # 300$ -> 284$ -> 269$
+    assert st["paused"] and "MIN_BALANCE_USD" in st["paused"]
+    assert 255 < sum(a.usdc for a in venue.accounts.values()) <= 270    # the last cycle ends a little under
+    assert not any(a.positions for a in venue.accounts.values())
     venue.accounts["A"].paper_raw = 5000 * SCALE
     run_for(bot, 120)
     assert venue.accounts["A"].staked_raw >= 5000 * SCALE

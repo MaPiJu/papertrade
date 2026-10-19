@@ -10,11 +10,11 @@ Deux stratégies :
 - **échelle (`STRATEGY=ladder`, par défaut)** : quand une jambe perd `LADDER_STEP_PCT` (0,20 %), le bot rouvre
   une position du même côté au prix du moment (même quantité de BTC que l'autre jambe) et ferme l'ancienne dès que
   la nouvelle est acceptée : sa perte mint du PAPER. L'autre jambe continue de courir. Quand une jambe gagne
-  `LADDER_RESET_PCT` (calculé à partir de l'émission pour rester sous le plafond de coût, ~2 % aujourd'hui), le bot
-  ferme tout et recommence. Le PAPER est minté par petites marches, et le gain, seul à subir la retenue, est encaissé
-  sur un grand mouvement : même coût par PAPER qu'une paire fermée à ~2 %, mais des périodes ~1,7 fois plus
-  courtes (elles s'arrêtent quand l'écart entre le plus haut et le plus bas atteint ~2 %, pas quand le prix s'est
-  éloigné de 2 % de son départ) ;
+  `LADDER_RESET_PCT` (2 % sans plafond de coût ; avec un plafond, calculé à partir de l'émission pour rester
+  dessous), le bot ferme tout et recommence. Le PAPER est minté par petites marches, et le gain, seul à subir la
+  retenue, est encaissé sur un grand mouvement : même coût par PAPER qu'une paire fermée à ~2 %, mais des périodes
+  ~1,7 fois plus courtes (elles s'arrêtent quand l'écart entre le plus haut et le plus bas atteint ~2 %, pas quand le
+  prix s'est éloigné de 2 % de son départ) ;
 - **paire (`STRATEGY=pair`)** : le wallet A ouvre un long, le wallet B un short ; dès que le prix a bougé de
   `CLOSE_MOVE_PCT`, le bot ferme les deux jambes ;
 - **un seul wallet (`ONE_WALLET=true`, conseillé avec l'échelle et un petit capital)** : le long et le short vivent
@@ -44,7 +44,13 @@ Dans tous les cas :
 - **staking automatique** : dès qu'un wallet détient 1 000 PAPER non stakés, le bot les stake, sans attendre de « go » ;
 - **rééquilibrage des USDC** (deux wallets) : après chaque cycle, le bot retire la moitié de l'écart du wallet riche
   vers HyperCore, puis l'envoie à l'adresse de dépôt PaperTrade de l'autre wallet ;
-- **arrêt automatique à 7 $ pour 1 000 PAPER** (le bot continue de staker) :
+- **arrêt automatique quand le solde tombe à `MIN_BALANCE_USD`** (50 $ dans `.env.example`, le bot continue de
+  staker) : avant chaque cycle, le bot additionne les USDC des deux wallets (file d'attente des profits comprise) ;
+  à `MIN_BALANCE_USD` ou moins, il n'en ouvre plus. Le cycle en cours se termine normalement : le dernier peut faire
+  passer le solde un peu sous le seuil, de son coût (quelques dollars) ;
+- **plafond de coût par PAPER, en option** (`MAX_COST_PER_1000_PAPER`, 0 dans `.env.example` ; la règle de rusk0f
+  est 7 $ pour 1 000 PAPER). Sans plafond, le bot farme quel que soit le coût du PAPER, qui monte quand l'émission
+  baisse (`plan` l'affiche). Avec un plafond :
   - *avant de payer* : un cycle n'est ouvert que si son coût prévu à l'émission du moment reste sous le plafond.
     L'échelle choisit son seuil d'encaissement pour rester 2 % dessous ; quand l'émission aura baissé d'environ 5 %
     (vers 18,0), plus aucun seuil ne convient et le farming s'arrête ;
@@ -77,13 +83,14 @@ idle ──► (transfert B→A ou rééquilibrage) ──► ouverture long + s
 - **Capital et notionnel minimum.** Une position doit faire au moins 1 000 $ de notionnel et 10 $ de marge. L'échelle
   dimensionne ses positions pour que la jambe qui perd puisse payer une période entière de marches ; sous ~44 $ par
   wallet (deux wallets) ou ~54 $ (un wallet) elle n'est plus possible et le bot passe à une paire fermée au même
-  seuil (même coût par PAPER), si elle reste sous le plafond.
+  seuil (même coût par PAPER), si elle reste sous le plafond (quand il y en a un).
 - **Retenue et frais vérifiés.** La jambe perdante perd exactement notionnel × mouvement (PAPER minté sur 98 % de la
   perte) ; la gagnante reçoit son gain après la retenue de la doc (« asymmetric impact ») et 2 % de frais. Les
   positions longues de plusieurs heures n'ont montré ni frais d'ouverture ni funding. Si la file d'attente des
   profits de PaperTrade est active, le gain de la jambe gagnante n'est pas disponible tout de suite.
 - **Le coût par PAPER a augmenté.** rusk0f s'est arrêté quand un cycle dépassait 7 $/1 000 PAPER. Si l'émission
-  actuelle est déjà basse, le plafond se déclenchera vite. `python -m ptbot plan` l'estime avant de lancer.
+  actuelle est déjà basse, ce plafond se déclenchera vite ; sans plafond, chaque PAPER coûte d'autant plus cher.
+  `python -m ptbot plan` l'estime avant de lancer.
 - **Risques du protocole.** Contrats non vérifiés et upgradables, LP unique, profits mis en file d'attente si la
   LP manque de liquidités, PAPER non transférable pour l'instant. Un saut de prix plus grand que l'écart gardé avant la
   liquidation (0,25 % pour l'échelle) pendant la dizaine de secondes d'une fermeture liquide la jambe perdante (le
@@ -162,7 +169,8 @@ pas conformes.
    qui doit afficher « long and short coexist as two positions on one wallet » en `PASS` (sinon, restez sur deux
    wallets), puis relancez `run` : la pause se lève seule.
 9. **`python -m ptbot plan`** : stratégie, émission, taille des positions, marche et seuil d'encaissement, PAPER et
-   coût attendus par période (formule vérifiée), comparés au plafond.
+   coût attendus par période (formule vérifiée), comparés au plafond s'il y en a un, et ce qui reste à dépenser avant
+   `MIN_BALANCE_USD`.
 10. **Premier lancement supervisé** dans `tmux` (le bot doit survivre à la fermeture du terminal) :
     `python -m ptbot run` et `tail -f data/bot.log`. Surveillez avec `python -m ptbot status` (pas avec le site).
     Vérifiez « Paire ouverte », les lignes « je la rouvre et ferme l'ancienne » puis « Jambe … réarmée », l'absence
@@ -222,7 +230,8 @@ bot reprend le cycle en cours (`data/state.json`). Pour tout couper : `close-all
 fichier plus ancien laissé en plein cycle est refusé au démarrage avec la marche à suivre. Une fois qu'un cycle en
 échelle ou sur un seul wallet a été ouvert, la version précédente refuse ce fichier au lieu de mal le lire.
 
-**Pauses** : le bot se met en pause (et continue de staker) quand le plafond de coût est atteint, quand un
+**Pauses** : le bot se met en pause (et continue de staker) quand le solde tombe à `MIN_BALANCE_USD` (rechargez ou
+baissez le seuil avant `resume`, sinon il se remet aussitôt en pause), quand le plafond de coût est atteint, quand un
 rééquilibrage reste bloqué 2 h, après 3 paires ratées d'affilée, après 6 ouvertures d'affilée acceptées mais jamais
 exécutées (PaperTrade met les ouvertures en file d'attente quand l'open interest est plein : le bot réessaie toutes
 les 10 min avant d'en arriver là), si une position reste listée après 8 tentatives de
@@ -240,7 +249,7 @@ le fausserait. `stake-now` refuse tant qu'un cycle est en cours ; arrêtez d'abo
 | `ONE_WALLET` | false | long et short sur le wallet A, l'USDC de B y est transféré une fois (test `--straddle` requis) ; conseillé avec l'échelle |
 | `LADDER_STEP_PCT` | 0.20 | échelle : perte à laquelle une jambe est rouverte et l'ancienne fermée |
 | `LADDER_LIQ_BUFFER_PCT` | 0.25 | échelle : liquidation des jambes à cette distance au-delà de la marche (fixe leur levier : x200 par défaut) |
-| `LADDER_RESET_PCT` | 0 | échelle : gain qui termine la période ; 0 = calculé depuis l'émission pour rester 2 % sous le plafond ; une valeur fixée dont le coût prévu dépasse le plafond est refusée (1 % ≈ 7,35 $/1 000 à l'émission 18,9) |
+| `LADDER_RESET_PCT` | 0 | échelle : gain qui termine la période ; 0 = 2 % sans plafond de coût, sinon calculé depuis l'émission pour rester 2 % sous le plafond ; avec un plafond, une valeur fixée dont le coût prévu le dépasse est refusée (1 % ≈ 7,35 $/1 000 à l'émission 18,9) |
 | `LADDER_MAX_LEVERAGE` | 1000 | échelle : levier maximum des jambes |
 | `LEVERAGE` / `MAX_LEVERAGE` | 250 / 250 | paire : levier visé / levier max autorisé pour rester au notionnel minimum |
 | `TARGET_NOTIONAL_USD` | 11000 | paire : marge par jambe = notionnel visé / levier (44 $ en x250) ; 0 = tout le solde |
@@ -249,7 +258,8 @@ le fausserait. `stake-now` refuse tant qu'un cycle est en cours ; arrêtez d'abo
 | `MARGIN_FRACTION` / `MAX_MARGIN_USD` | 1.0 / 0 | marge par jambe = plus petit solde × fraction (plafonnée) |
 | `REBALANCE_THRESHOLD_PCT` / `MIN_REBALANCE_USD` | 10 / 11 | quand rééquilibrer (11 minimum : retraits et dépôts de 10 USDC, +1 USDC d'activation HyperCore au premier retrait) |
 | `STAKE_THRESHOLD_PAPER` | 1000 | seuil de staking automatique |
-| `MAX_COST_PER_1000_PAPER` / `COST_WINDOW` | 7 / 1 | plafond de coût ; paire : jugé sur la moyenne des N derniers cycles (l'échelle, elle, est jugée sur ses 20 dernières périodes, voir plus haut) |
+| `MIN_BALANCE_USD` | 0 | plus de cycle dès que le solde total (USDC des deux wallets, file d'attente des profits comprise) est inférieur ou égal à ce montant ; 0 = jamais (50 dans `.env.example`) |
+| `MAX_COST_PER_1000_PAPER` / `COST_WINDOW` | 7 / 1 | plafond de coût, 0 = aucun (0 dans `.env.example`) ; paire : jugé sur la moyenne des N derniers cycles (l'échelle, elle, est jugée sur ses 20 dernières périodes, voir plus haut) |
 | `OPEN_DEADLINE_S` | 120 | durée de validité d'un ordre d'ouverture (à monter si le relayer est lent) |
 
 Le coût par PAPER ne dépend que du mouvement sur lequel le gain est encaissé (`CLOSE_MOVE_PCT` pour la paire,
@@ -300,10 +310,10 @@ python -m pytest -q
 ```
 
 Signatures EIP-712, logique de décision, parseur de positions, et scénarios de bout en bout contre le simulateur :
-cycle normal, staking, rééquilibrage, gap au-delà de la liquidation, plafond de coût, jambe refusée, réponse
-perdue, positions invisibles, reprise après redémarrage. `tests/test_faults.py` couvre les pannes : réponses
-perdues, exécutions tardives, ordres jamais exécutés, lectures d'API vides ou en retard, positions fantômes, crash
-entre un ordre et la sauvegarde, transferts et stakes lents.
+cycle normal, staking, rééquilibrage, gap au-delà de la liquidation, plafond de coût, plancher de solde, jambe
+refusée, réponse perdue, positions invisibles, reprise après redémarrage. `tests/test_faults.py` couvre les pannes :
+réponses perdues, exécutions tardives, ordres jamais exécutés, lectures d'API vides ou en retard, positions fantômes,
+crash entre un ordre et la sauvegarde, transferts et stakes lents.
 
 ## Sources
 

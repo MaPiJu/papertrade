@@ -6,7 +6,7 @@ import pytest
 
 from ptbot.bot import Bot, StateStore, Timing
 from ptbot.constants import SCALE
-from ptbot.papertrade_api import _list_payload
+from ptbot.papertrade_api import IntentRejected, _list_payload
 from ptbot.positions import Position
 from ptbot.sim import SimVenue
 
@@ -506,6 +506,47 @@ def test_orders_that_never_execute_are_retried_later_then_pause(tmp_path):
     run_for(bot, 6000)
     assert store.data["paused"] and "jamais exécutées" in store.data["paused"]
     assert venue.calls["open", "A"] == bot.t.unfilled_pause_after
+
+
+FULL = "openPosition refusé (HTTP 409): {'code': 'admission_rejected', 'reason': 'openInterest'}"
+
+
+class FullVenue(FaultVenue):
+    """PaperTrade refuses new positions (open interest full): the first `full` opens, or every short."""
+
+    def __init__(self, *a, full=0, shorts_full=False, **kw):
+        super().__init__(*a, **kw)
+        self.full, self.shorts_full = full, shorts_full
+
+    def open(self, w, coin, is_long, margin, leverage, deadline_s):
+        if self.full > 0 or (self.shorts_full and not is_long):
+            self.full -= 1
+            self.calls["refused"] += 1
+            raise IntentRejected(FULL)
+        return super().open(w, coin, is_long, margin, leverage, deadline_s)
+
+
+def test_a_full_open_interest_is_retried_every_10_minutes_instead_of_pausing(tmp_path):
+    venue = FullVenue(Path([(0, 100_000)]), full=4, start_usdc=100, emission=50)
+    store = StateStore(tmp_path / "state.json")
+    bot = Bot(venue, x100(), store, Timing())
+    run_for(bot, 300)
+    assert venue.calls["refused"] == 1 and not legs_open(venue)["A"]    # nothing opened, nothing to close
+    run_for(bot, 3 * 600)
+    assert venue.calls["refused"] == 4                                   # one try every 10 minutes
+    assert not store.data["paused"] and store.data["open_failures"] == 0
+    run_for(bot, 600)
+    assert store.data["phase"] == "open" and all(len(ids) == 1 for ids in legs_open(venue).values())
+
+
+def test_a_second_leg_refused_for_open_interest_still_counts(tmp_path):
+    # The long fills, the short is refused, the long is closed again: that costs a little, so it is bounded.
+    venue = FullVenue(Path([(0, 100_000)]), shorts_full=True, start_usdc=100, emission=50)
+    store = StateStore(tmp_path / "state.json")
+    bot = Bot(venue, x100(), store, Timing())
+    run_for(bot, 600)
+    assert store.data["paused"] and "3 paires ratées" in store.data["paused"]
+    assert venue.calls["close", "A"] == 3 and not legs_open(venue)["A"]
 
 
 def test_oldest_first_feed_is_followed_to_its_end_and_cached():

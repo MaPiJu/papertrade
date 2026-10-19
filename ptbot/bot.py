@@ -82,8 +82,8 @@ class Timing:
     heartbeat_s: float = 60.0
     rearm_attempts: int = 3          # ladder: re-opens of a leg before ending the period
     rearm_retry_s: float = 8.0
-    unfilled_retry_s: float = 600.0  # orders accepted but never filled (PaperTrade's queue full): retry after
-    unfilled_pause_after: int = 6    # ...and pause after this many in a row
+    unfilled_retry_s: float = 600.0  # PaperTrade full (first open refused for open interest, or never filled): retry
+    unfilled_pause_after: int = 6    # ...and pause after this many unfilled opens in a row
     rearm_naked_s: float = 60.0      # ladder: longest wait for a re-opened leg after the old one's close
                                      # (half of open_deadline_s when that is longer)
 
@@ -437,7 +437,15 @@ class Bot:
         self.st["intents_valid_until"] = cycle["deadline"] + self.t.indexer_slack_s
         self.store.save()  # write-ahead: a crash during the request below resumes in 'opening'
         self._send_open(cycle, order[0])
-        if cycle["legs"][order[0]]["status"] == "rejected":
+        if cycle["legs"][order[0]]["status"] != "rejected":
+            return
+        if cycle.get("open_interest_full"):
+            # PaperTrade is full and nothing was opened: not a failure, try again later. (A second leg refused
+            # for the same reason still counts: the first one had to be closed, which costs a little.)
+            self.st["next_try"] = now + self.t.unfilled_retry_s
+            log.warning("Open interest de PaperTrade plein, rien d'ouvert: nouvel essai dans %.0f min",
+                        self.t.unfilled_retry_s / 60)
+        else:
             self._open_failed(cycle, "ouverture refusée")
 
     def _send_open(self, c: dict, name: str) -> None:
@@ -451,6 +459,7 @@ class Bot:
             log.error("Ouverture refusée sur %s: %s", name, e)
             if "openInterest" in str(e):   # the other side lowers the net open interest: start with it
                 self.st["open_first"] = "B" if name == "A" else "A"
+                c["open_interest_full"] = True
         except Exception as e:
             leg["status"] = "unknown"
             log.warning("Ouverture sur %s: pas de réponse claire (%s). L'ordre a peut-être été exécuté, je surveille",

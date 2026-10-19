@@ -237,6 +237,9 @@ exécutées (PaperTrade met les ouvertures en file d'attente quand l'open intere
 les 10 min avant d'en arriver là), si une position reste listée après 8 tentatives de
 fermeture (cette pause se lève d'elle-même si la position finit par disparaître), ou si les soldes bougent alors que
 l'API ne montre aucune position. Le motif est dans `data/bot.log`. Corrigez, puis `python -m ptbot resume`.
+Une première jambe refusée parce que l'open interest de PaperTrade est plein (`openInterest`) n'est pas une paire
+ratée : rien n'a été ouvert, le bot réessaie 10 min plus tard, sans limite. Une deuxième jambe refusée pour la même
+raison compte, elle : la première a dû être refermée, ce qui coûte un peu.
 
 **Ne stakez pas à la main pendant un cycle** : le PAPER du cycle est mesuré sur le solde non staké, un stake manuel
 le fausserait. `stake-now` refuse tant qu'un cycle est en cours ; arrêtez d'abord le bot (fichier `STOP`).

@@ -148,6 +148,8 @@ def test_open_interest_refusal_opens_the_other_side_first(tmp_path):
 
     venue, store, bot = make(tmp_path, [(0, 100_000)], ladder(), venue_cls=RefuseFirstLong)
     run_until(bot, 200)
+    assert venue.order == ["long"]                       # nothing opened: tried again 10 minutes later
+    run_until(bot, 800)
     assert venue.order[:3] == ["long", "short", "long"]
     assert store.data["phase"] == "open"
 

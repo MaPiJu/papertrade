@@ -41,7 +41,8 @@ Dans tous les cas :
   de l'échelle se liquident `LADDER_LIQ_BUFFER_PCT` (0,25 %) au-delà de leur marche, assez pour la dizaine de
   secondes d'une fermeture, même par forte volatilité (rares sauts de prix exceptés : une liquidation coûte alors
   une marge, pas plus, l'autre jambe gagnant le même mouvement) ;
-- **staking automatique** : dès qu'un wallet détient 1 000 PAPER non stakés, le bot les stake, sans attendre de « go » ;
+- **staking automatique** : dès qu'un wallet détient 1 000 PAPER non stakés, le bot les stake, sans attendre de « go »,
+  y compris au milieu d'une période d'échelle (entre deux réarmements) ;
 - **rééquilibrage des USDC** (deux wallets) : après chaque cycle, le bot retire la moitié de l'écart du wallet riche
   vers HyperCore, puis l'envoie à l'adresse de dépôt PaperTrade de l'autre wallet ;
 - **arrêt automatique quand le solde tombe à `MIN_BALANCE_USD`** (50 $ dans `.env.example`, le bot continue de
@@ -241,8 +242,9 @@ Une première jambe refusée parce que l'open interest de PaperTrade est plein (
 ratée : rien n'a été ouvert, le bot réessaie 10 min plus tard, sans limite. Une deuxième jambe refusée pour la même
 raison compte, elle : la première a dû être refermée, ce qui coûte un peu.
 
-**Ne stakez pas à la main pendant un cycle** : le PAPER du cycle est mesuré sur le solde non staké, un stake manuel
-le fausserait. `stake-now` refuse tant qu'un cycle est en cours ; arrêtez d'abord le bot (fichier `STOP`).
+**Ne stakez pas à la main pendant un cycle** : le PAPER du cycle est mesuré sur le solde non staké ; le bot rajoute
+ce qu'il a staké lui-même, mais un stake manuel fausserait le compte. `stake-now` refuse tant qu'un cycle est en
+cours ; arrêtez d'abord le bot (fichier `STOP`).
 
 ## Paramètres (.env)
 

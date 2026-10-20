@@ -1,5 +1,6 @@
 """Ladder strategy: the losing leg is re-armed in small steps, the winner is realised on a large move."""
 from ptbot.bot import Bot, StateStore, Timing
+from ptbot.constants import SCALE
 from ptbot.papertrade_api import IntentRejected
 from ptbot.strategy import Params
 
@@ -410,3 +411,37 @@ def test_a_reset_reached_during_a_rearm_is_a_normal_period(tmp_path):
         bot.run(max_steps=1)
     st = store.data
     assert st["cycles_all"][0]["kind"] == "normal" and st["history"]
+
+
+def minted(venue):
+    return sum(a.paper_raw + a.staked_raw for a in venue.accounts.values()) / SCALE
+
+
+def test_paper_minted_during_a_period_is_staked_before_the_period_ends(tmp_path):
+    venue, store, bot = make(tmp_path, UP, ladder())
+    run_until(bot, 450)
+    assert store.data["phase"] == "open" and venue.accounts["B"].staked_raw > 0    # 2 re-arms: ~1,080 PAPER
+    run_until(bot, 760)
+    assert abs(store.data["history"][0]["paper"] - minted(venue)) < 1               # still the period's PAPER
+
+
+def test_a_stake_is_confirmed_while_the_period_keeps_minting(tmp_path):
+    # The stake lands 250 s after it is sent, once a 0.39% step has minted ~75% of its amount again.
+    points = UP[:3] + [(450, 100_910), (700, 101_040)]
+    venue, store, bot = make(tmp_path, points, ladder(), faults={"stake": {"delay": 250}})
+    run_until(bot, 570)
+    st = store.data
+    assert st["phase"] == "open" and venue.accounts["B"].staked_raw > 0
+    assert not st["pending_stakes"] and not st["stake_failures"]
+    assert abs(st["totals"]["paper_staked"] * SCALE - venue.accounts["B"].staked_raw) < SCALE
+    run_until(bot, 760)
+    assert abs(st["history"][0]["paper"] - minted(venue)) < 1
+
+
+def test_a_period_is_booked_only_once_its_stake_is_settled(tmp_path):
+    # Sent after the 3rd re-arm, the stake lands after the period's legs are closed.
+    venue, store, bot = make(tmp_path, UP, ladder(stake_threshold=1500), faults={"stake": {"delay": 250}})
+    run_until(bot, 730)
+    assert store.data["phase"] == "closing" and store.data["pending_stakes"] and not store.data["history"]
+    run_until(bot, 800)
+    assert abs(store.data["history"][0]["paper"] - minted(venue)) < 1

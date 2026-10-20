@@ -654,6 +654,13 @@ class Bot:
             self._send_close(now, list(LEGS))
             self.st["phase"] = "closing"
             return
+        # A ladder period mints PAPER at every re-arm and can last hours: stake it as it comes, right after a
+        # price check (that PAPER is added back to the cycle's count when the cycle is booked).
+        try:
+            self._track_stakes(now)
+            self.stake_if_needed(now)
+        except Exception as e:
+            log.warning("Stake pendant le cycle reporté (%s)", e)
         if now >= c["next_poll"]:
             # One leg per poll, so a slow read never delays the price check above for long.
             leg = LEGS[c.get("read_turn", 0) % len(LEGS)]
@@ -999,6 +1006,9 @@ class Bot:
         if visible or unconfirmed or waiting or self.st["strays"]:
             c["settle_at"] = None
             return
+        if self.st["pending_stakes"]:   # sent during the cycle: its PAPER must be known before the cycle is booked
+            self._track_stakes(now)
+            return
         if c["settle_at"] is None:
             c["settle_at"] = now + self.t.settle_s
             return
@@ -1017,7 +1027,7 @@ class Bot:
         c = self.st["cycle"]
         free = sum(self.v.usdc(w) for w in WALLETS)
         queued = sum(self.v.queued(w) for w in WALLETS)
-        paper = (sum(self.v.paper_raw(w) for w in WALLETS) - c["paper_start"]) / SCALE
+        paper = (sum(self.v.paper_raw(w) for w in WALLETS) - c["paper_start"] + c.get("paper_staked_raw", 0)) / SCALE
         legs_opened = sum(1 for leg in c["legs"].values() if leg["pos_id"] is not None)
         returned = free + queued - (c["equity_start"] - legs_opened * c["margin"])
         self.st["cycle"] = None
@@ -1091,9 +1101,13 @@ class Bot:
         self.st["next_stake_track"] = now + self.t.stake_track_s
         for w in list(pending):
             ps = pending[w]
-            # Dropped by at least half the stake: executed, even if some PAPER was minted meanwhile.
-            if self.v.paper_raw(w) <= ps["before"] - ps["raw"] // 2:
+            # PAPER is not transferable, only a stake takes it out of the wallet: any drop below the balance it was
+            # sent at means it executed, even while a ladder period keeps minting PAPER.
+            if self.v.paper_raw(w) < ps["before"]:
                 self.st["totals"]["paper_staked"] += ps["raw"] / SCALE
+                c = self.st.get("cycle")
+                if c:   # sent during this cycle (none opens while a stake is pending): still the cycle's PAPER
+                    c["paper_staked_raw"] = c.get("paper_staked_raw", 0) + ps["raw"]
                 log.info("Wallet %s: stake de %s PAPER confirmé", w, f"{ps['raw'] / SCALE:,.0f}")
                 del pending[w]
                 self.st["stake_failures"].pop(w, None)
@@ -1113,8 +1127,9 @@ class Bot:
 
     def stake_if_needed(self, now: float, force: bool = False) -> None:
         """Stakes each wallet's whole unstaked PAPER once it reaches the threshold.
-        Called between cycles (PAPER is minted when positions close); no pair is
-        opened while a stake is unconfirmed, so it cannot skew a cycle's count."""
+        Called between cycles and while a cycle's legs are open (a ladder period mints
+        PAPER at every re-arm). No pair is opened while a stake is unconfirmed and no
+        cycle is booked before its stakes are settled, so they never skew its count."""
         if not force and now - self._last_stake_check < self.t.stake_every_s:
             return
         self._last_stake_check = now

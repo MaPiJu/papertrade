@@ -348,6 +348,13 @@ class Bot:
             self.st["next_try"] = now + self.t.fast_poll_s
             return
         bal = {w: self.v.usdc(w) for w in WALLETS}
+        floor = self.p.min_balance_usd
+        if floor > 0:
+            # No position is open here: both wallets' USDC (profit queue included) is all that is left.
+            left = sum(bal.values()) + sum(self.v.queued(w) for w in WALLETS)
+            if left <= floor:
+                self.pause(f"solde {left:.2f}$ ≤ {floor:.2f}$ (MIN_BALANCE_USD): farming arrêté")
+                return
         mins = self.v.minimums()
         if self.p.one_wallet:
             # Everything trades from wallet A: bring B's USDC over (a transfer needs 11 USDC).
@@ -1056,6 +1063,8 @@ class Bot:
         log.info("Cycle #%d %sterminé en %.0f min: coût %.2f$, +%s PAPER (%.2f$/1000). Total: %s PAPER pour %.2f$",
                  c["n"], note, (now - c["started"]) / 60, usd, f"{paper:,.0f}",
                  cost_per_1000(usd, paper), f"{tot['paper_minted']:,.0f}", tot["usd_spent"])
+        if self.p.max_cost_per_1000 <= 0:
+            return   # no cost cap (the balance floor is checked before the next cycle)
         hit, avg = cost_cap_hit(self.st["history"], self.p)
         everything = self.st["cycles_all"]
         if mode != "ladder":

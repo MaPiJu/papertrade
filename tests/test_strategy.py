@@ -157,6 +157,21 @@ def test_choose_plan_refuses_a_pair_that_costs_more_than_the_cap():
     assert note and plan.close_move == 0.0205 and plan.leverage <= 44
 
 
+def test_without_a_cost_cap_no_cycle_is_refused_for_its_cost():
+    from ptbot.strategy import choose_plan, plan_ladder
+    one = {"A": 110.0, "B": 0.0}
+    no_cap = Params(strategy="ladder", one_wallet=True, max_cost_per_1000=0)
+    assert plan_ladder(one, 10, 1000, 16.5, no_cap).reset == 0.02       # ~7.9$/1000: no move fits a 7$ cap
+    assert plan_ladder(one, 10, 1000, None, no_cap).reset == 0.02       # the emission is not even needed
+    fixed = Params(strategy="ladder", one_wallet=True, ladder_reset=0.01, max_cost_per_1000=0)
+    assert plan_ladder(one, 10, 1000, 18.9, fixed).reset == 0.01        # ~7.35$/1000: refused under a 7$ cap
+    pair = Params(strategy="pair", leverage=250, max_leverage=250, close_move=0.007, max_cost_per_1000=0)
+    assert isinstance(choose_plan({"A": 50.0, "B": 50.0}, 10, 1000, 18.9, pair)[0], OpenPlan)   # ~11$/1000
+    # Too little for the ladder: the fallback pair is closed at the same +2%.
+    plan, note = choose_plan({"A": 30.0, "B": 30.0}, 10, 1000, 16.5, Params(strategy="ladder", max_cost_per_1000=0))
+    assert note and plan.close_move == 0.02
+
+
 def test_ladder_cost_rule_ignores_fill_noise_but_not_a_real_excess():
     import random
 

@@ -160,9 +160,14 @@ def cmd_plan(settings, args) -> None:
               "le cycle suivant, avec la marge que celui-ci bloque encore (au gain ou à la perte près)")
         for w in bal:
             bal[w] += sum(pos.margin or 0 for pos in venue.positions(w))
+    left = sum(bal.values()) + sum(venue.queued(w) for w in bal)
     print(f"Soldes PaperTrade: A={bal['A']:.2f}$  B={bal['B']:.2f}$   minimums: marge {mins[0]:.2f}$, notionnel {mins[1]:,.0f}$")
     print(f"Émission: {f'~{emission:.2f} PAPER par $ perdu' if emission else 'illisible'}   stratégie: {p.strategy}"
           f"{', un seul wallet (A)' if p.one_wallet else ''}")
+    floor = p.min_balance_usd
+    if floor > 0 and left <= floor:
+        print(f"-> pas de cycle: solde {left:.2f}$ ≤ {floor:.2f}$ (MIN_BALANCE_USD), farming arrêté")
+        return
     if p.one_wallet:
         moved = float(math.floor(bal["B"]))
         if moved >= MIN_CORE_TRANSFER_USD:
@@ -180,6 +185,7 @@ def cmd_plan(settings, args) -> None:
     if isinstance(plan, Skip):
         print(f"-> pas de cycle: {plan.reason}")
         return
+    cap = f", plafond {p.max_cost_per_1000:.2f}$" if p.max_cost_per_1000 > 0 else ""
     if plan.reset:
         step_loss = plan.notional * plan.close_move
         cost = plan.notional * (plan.reset - win_payout(plan.reset, p.coin))
@@ -190,17 +196,23 @@ def cmd_plan(settings, args) -> None:
               f"{1 / plan.leverage - 0.0005:.2%}")
         print(f"   période terminée quand l'autre jambe gagne {plan.reset:.2%}: ~{plan.reset / plan.close_move:.0f} "
               f"marches, ~{plan.notional * plan.reset * MINT_FACTOR * (emission or 0):,.0f} PAPER pour ~{cost:.2f}$"
-              + (f" (~{cost_per_1000_at(plan.reset, emission, p.coin):.2f}$/1000, plafond {p.max_cost_per_1000:.2f}$)"
-                 if emission else ""))
+              + (f" (~{cost_per_1000_at(plan.reset, emission, p.coin):.2f}$/1000{cap})" if emission else ""))
     else:
         loss = plan.notional * plan.close_move
         cost = plan.notional * (plan.close_move - win_payout(plan.close_move, p.coin))
         print(f"-> paire: marge {plan.margin:.2f}$ x{plan.leverage} par jambe ({plan.notional:,.0f}$ de notionnel), "
               f"fermeture à ±{plan.close_move:.2%}: la jambe perdante perd ~{loss:.2f}$ "
               f"(~{loss * MINT_FACTOR * (emission or 0):,.0f} PAPER), coût net ~{cost:.2f}$"
-              + (f" (~{cost_per_1000_at(plan.close_move, emission, p.coin):.2f}$/1000, plafond "
-                 f"{p.max_cost_per_1000:.2f}$)" if emission else ""))
-    if plan.reset:
+              + (f" (~{cost_per_1000_at(plan.close_move, emission, p.coin):.2f}$/1000{cap})" if emission else ""))
+    if floor > 0:
+        rate = cost_per_1000_at(plan.reset or plan.close_move, emission, p.coin) if emission else 0
+        print(f"   Arrêt quand le solde total ({left:.2f}$) tombe à {floor:.2f}$ ou moins: encore ~{left - floor:.2f}$ "
+              "à dépenser"
+              + (f", soit ~{(left - floor) / rate * 1000:,.0f} PAPER à l'émission actuelle" if rate else ""))
+    if not cap:
+        if floor <= 0:
+            print("   Ni plafond de coût ni MIN_BALANCE_USD: le bot farme tant que le capital permet d'ouvrir un cycle.")
+    elif plan.reset:
         print(f"   Le coût réel de chaque période varie de ~±1$/1000 autour de ce chiffre (latence des ordres): le bot "
               f"s'arrête si la moyenne des {LADDER_COST_WINDOW} dernières périodes dépasse nettement le plafond.")
     else:

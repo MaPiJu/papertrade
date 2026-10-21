@@ -67,6 +67,7 @@ def load_settings(env_file: str = ".env", need_keys: bool = True) -> Settings:
         stake_threshold=_f("STAKE_THRESHOLD_PAPER", 1000),
         max_cost_per_1000=_f("MAX_COST_PER_1000_PAPER", 7),
         cost_window=int(_f("COST_WINDOW", 1)),
+        min_balance_usd=_f("MIN_BALANCE_USD", 0),
         strategy=strategy,
         ladder_step=_pct("LADDER_STEP_PCT", 0.20),
         ladder_liq_buffer=_pct("LADDER_LIQ_BUFFER_PCT", 0.25),

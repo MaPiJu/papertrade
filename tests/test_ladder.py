@@ -136,7 +136,7 @@ def test_rearm_stops_when_the_losing_wallet_cannot_afford_it(tmp_path):
     assert venue.liquidations == 0
 
 
-def test_open_interest_refusal_opens_the_other_side_first(tmp_path):
+def test_an_open_interest_refusal_sends_the_refused_side_first_next_time(tmp_path):
     class RefuseFirstLong(FaultVenue):
         order = []
 
@@ -147,9 +147,9 @@ def test_open_interest_refusal_opens_the_other_side_first(tmp_path):
             return super().open(w, coin, is_long, margin, leverage, deadline_s)
 
     venue, store, bot = make(tmp_path, [(0, 100_000)], ladder(), venue_cls=RefuseFirstLong)
-    run_until(bot, 200)
-    assert venue.order[:3] == ["long", "short", "long"]
-    assert store.data["phase"] == "open"
+    run_until(bot, 900)
+    assert venue.order[:3] == ["long", "long", "short"]           # refused alone (nothing open), retried first
+    assert store.data["phase"] == "open" and not store.data.get("paused")
 
 
 def test_a_classic_pair_from_the_previous_version_finishes_as_a_pair(tmp_path):
@@ -408,3 +408,21 @@ def test_a_reset_reached_during_a_rearm_is_a_normal_period(tmp_path):
         bot.run(max_steps=1)
     st = store.data
     assert st["cycles_all"][0]["kind"] == "normal" and st["history"]
+
+
+def test_longs_refused_for_open_interest_wait_without_exposure_or_failure_pause(tmp_path):
+    class NoLongs(FaultVenue):
+        def open(self, w, coin, is_long, margin, leverage, deadline_s):
+            self.calls["open", "long" if is_long else "short"] += 1
+            if is_long:
+                raise IntentRejected("openPosition refusé (HTTP 409): {'code': 'admission_rejected', 'reason': 'openInterest'}")
+            return super().open(w, coin, is_long, margin, leverage, deadline_s)
+
+    venue, store, bot = make(tmp_path, [(0, 100_000)], ladder(one_wallet=True), venue_cls=NoLongs)
+    store.data["open_first"] = "B"                     # as on the live server: the short went first
+    run_until(bot, 1500)
+    st = store.data
+    assert venue.calls["open", "short"] == 1 and venue.max_positions <= 1   # one lone short, closed at once
+    assert st["open_first"] == "A" and not st.get("paused")                # then the long goes first, alone
+    run_until(bot, 6000)
+    assert st["paused"] and "open interest" in st["paused"] and venue.calls["open", "short"] == 1

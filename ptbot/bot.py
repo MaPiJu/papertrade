@@ -430,7 +430,8 @@ class Bot:
         self.st["intents_valid_until"] = cycle["deadline"] + self.t.indexer_slack_s
         self.store.save()  # write-ahead: a crash during the request below resumes in 'opening'
         self._send_open(cycle, order[0])
-        if cycle["legs"][order[0]]["status"] == "rejected":
+        first = cycle["legs"][order[0]]
+        if first["status"] == "rejected" and not first.get("full"):
             self._open_failed(cycle, "ouverture refusée")
 
     def _send_open(self, c: dict, name: str) -> None:
@@ -442,8 +443,11 @@ class Bot:
         except IntentRejected as e:
             leg["status"] = "rejected"
             log.error("Ouverture refusée sur %s: %s", name, e)
-            if "openInterest" in str(e):   # the other side lowers the net open interest: start with it
-                self.st["open_first"] = "B" if name == "A" else "A"
+            if "openInterest" in str(e):
+                # PaperTrade's open-interest cap on that side: it goes first next time, alone, so a
+                # refusal leaves nothing open.
+                leg["full"] = True
+                self.st["open_first"] = name
         except Exception as e:
             leg["status"] = "unknown"
             log.warning("Ouverture sur %s: pas de réponse claire (%s). L'ordre a peut-être été exécuté, je surveille",
@@ -543,7 +547,10 @@ class Bot:
             self._send_open(c, second)
             if c["legs"][second]["status"] == "rejected":
                 self._abort(now, found)
-                self._open_failed(c, "ouverture refusée")
+                if c["legs"][second].get("full"):
+                    self._capacity_wait(now)
+                else:
+                    self._open_failed(c, "ouverture refusée")
             return
         if len(found) == len(LEGS):
             self.st["open_failures"] = 0
@@ -573,6 +580,8 @@ class Bot:
         if not waiting:  # every leg was refused outright (already counted)
             self.st["cycle"] = None
             self.st["phase"] = "idle"
+            if any(c["legs"][n].get("full") for n in LEGS):
+                self._capacity_wait(now)
             return
         equity_now = sum(self.v.usdc(w) + self.v.queued(w) for w in WALLETS)   # read before changing the state
         self._cancel_pending(c)
@@ -585,15 +594,20 @@ class Bot:
         # Nothing left the balances: the orders really did not fill. PaperTrade queues new positions
         # while open interest is full, so try again later; many in a row is abnormal (refused size or
         # leverage, positions the bot cannot see): stop then.
+        self._capacity_wait(now)
+
+    def _capacity_wait(self, now: float) -> None:
+        """PaperTrade is full (open queued past its deadline, or refused for open interest): nothing
+        was spent, try again later. Many in a row is abnormal (refused size or leverage, positions the
+        bot cannot see): pause then."""
         unfilled = self.st["unfilled_opens"] = self.st.get("unfilled_opens", 0) + 1
         if unfilled >= self.t.unfilled_pause_after:
-            self.pause(f"{unfilled} ouvertures d'affilée acceptées mais jamais exécutées avant leur échéance: vérifiez "
-                       "sur le site (file d'attente pleine ? positions invisibles ?) puis `resume`")
+            self.pause(f"{unfilled} ouvertures d'affilée refusées (open interest) ou jamais exécutées avant leur "
+                       "échéance: vérifiez sur le site (file d'attente pleine ? positions invisibles ?) puis `resume`")
             return
         self.st["next_try"] = now + self.t.unfilled_retry_s
-        log.warning("Ordres acceptés mais pas exécutés avant leur échéance (file d'attente de PaperTrade pleine ?): "
-                    "nouvel essai dans %.0f min (%d/%d)", self.t.unfilled_retry_s / 60, unfilled,
-                    self.t.unfilled_pause_after)
+        log.warning("PaperTrade plein (open interest): nouvel essai dans %.0f min (%d/%d)",
+                    self.t.unfilled_retry_s / 60, unfilled, self.t.unfilled_pause_after)
 
     def _abort(self, now: float, wallets: list[str]) -> None:
         self.st["cycle"]["aborted"] = True
